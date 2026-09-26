@@ -1,0 +1,31 @@
+{
+  "application": {
+    "name": "MY-APP",
+    "instance": [
+      {
+        "instanceId": "host-1:my-app:3000",
+        "hostName": "host-1",
+        "app": "MY-APP",
+        "ipAddr": "10.0.0.1",
+        "status": "UP",
+        "port": { "$": 3000, "@enabled": true },
+        "securePort": { "$": 0, "@enabled": false },
+        "vipAddress": "my-app",
+        "secureVipAddress": "my-app",
+        "metadata": { "region": "local" }
+      },
+      {
+        "instanceId": "host-2:my-app:3000",
+        "hostName": "host-2",
+        "app": "MY-APP",
+        "ipAddr": "10.0.0.2",
+        "status": "DOWN",
+        "port": { "$": 3000, "@enabled": true },
+        "securePort": { "$": 0, "@enabled": false },
+        "vipAddress": "my-app",
+        "secureVipAddress": "my-app",
+        "metadata": {}
+      }
+    ]
+  }
+}

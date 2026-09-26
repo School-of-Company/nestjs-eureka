@@ -1,0 +1,20 @@
+{
+  "application": {
+    "name": "MY-APP",
+    "instance": {
+      "instanceId": "host-1:my-app:3000",
+      "hostName": "host-1",
+      "app": "MY-APP",
+      "ipAddr": "10.0.0.1",
+      "status": "UP",
+      "port": { "$": 3000, "@enabled": "true" },
+      "securePort": { "$": 443, "@enabled": "false" },
+      "vipAddress": "my-app",
+      "secureVipAddress": "my-app",
+      "metadata": { "@class": "java.util.Collections$EmptyMap" },
+      "homePageUrl": "http://host-1:3000/",
+      "statusPageUrl": "http://host-1:3000/info",
+      "healthCheckUrl": "http://host-1:3000/health"
+    }
+  }
+}
