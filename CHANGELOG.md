@@ -23,3 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `@nestjs/common` is now a peer dependency (`^11.0.0`) instead of a regular dependency; `@nestjs/core`/`@nestjs/platform-express` are no longer runtime dependencies of this package.
 - Shutdown now aborts an in-flight heartbeat/registration request instead of waiting for it to settle or time out. A cancelled registration whose outcome is unknown still triggers a best-effort deregistration.
 - Minimum supported Node.js version is now 20.3.0 (was 20.0.0) — required for `AbortSignal.any`.
+
+### Fixed
+
+- `serviceUrl` given as multiple URLs joined into one string (e.g. Spring's comma-joined `defaultZone` convention, or URLs accidentally joined by a newline/space/semicolon) without embedded credentials was silently mis-parsed as a single, garbled URL instead of being rejected — the rejection check only looked for `@` in the parsed path, which is absent when neither URL has basic-auth credentials. Now detected on the raw input before parsing, for any of these separators and regardless of credentials, without falsely rejecting a single URL whose password happens to contain a literal comma or semicolon.
