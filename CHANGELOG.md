@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `requestTimeoutMs` option (default 5000) — replaces the previous fixed, non-configurable 5-second request timeout.
 - Public types: `EurekaModuleOptions`, `EurekaModuleAsyncOptions`, `EurekaOptionsFactory`, `EurekaInstanceOptions`, `EurekaInstance`, `EurekaInstanceStatus`.
 - CI (GitHub Actions): lint, unit tests with coverage, e2e tests, and build run on every push/PR to `master`, against Node.js 20.3.0 and 22. Coverage is reported (uploaded as an artifact, and posted as a PR comment) but not gated on a threshold.
+- `serviceUrl` now also accepts an array of URLs for failover. A network error/timeout or a 5xx response tries the next server; a 4xx does not. The server that last completed a call successfully is preferred on the next call — see README's "Failover across multiple servers".
 
 ### Changed
 

@@ -29,6 +29,7 @@ export class EurekaStubServer {
    *  so a test can deterministically wait for one to actually be in flight. */
   hangingRenewalCount = 0;
   private port = 0;
+  private closed = false;
 
   constructor() {
     this.server = createServer((req, res) => {
@@ -46,7 +47,11 @@ export class EurekaStubServer {
     if (address && typeof address === 'object') this.port = address.port;
   }
 
+  /** Idempotent — safe to call more than once (e.g. from a test's `finally`
+   *  after an already-explicit close earlier in the same test). */
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     // A hung/aborted renewal leaves its server-side socket open (the client
     // cancelling its own request doesn't close the underlying TCP
     // connection) — without this, server.close() would hang waiting for it.

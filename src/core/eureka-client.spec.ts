@@ -360,5 +360,282 @@ describe('EurekaClient', () => {
         expect(init.signal!.aborted).toBe(false);
       }
     });
+
+    it('a caller-signal abort during multi-server failover propagates immediately with zero further attempts', async () => {
+      fetchMock.mockImplementation(hangingFetch);
+      const controller = new AbortController();
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: ['http://a:8761/eureka', 'http://b:8762/eureka'],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+
+      const pending = client.renew(controller.signal).catch((e: unknown) => e);
+      controller.abort();
+      const error = await pending;
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect(((error as EurekaRequestError).cause as Error).name).toBe(
+        'AbortError',
+      );
+      // Only server A was ever attempted — the abort is not a per-server
+      // failure to fail over from, it's an immediate stop.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('a plain per-server timeout (no caller abort) does fail over to the next server', async () => {
+      fetchMock.mockImplementation((url: string, init: RequestInit) =>
+        url.includes('a:8761')
+          ? hangingFetch(url, init)
+          : Promise.resolve(mockResponse({ ok: true, status: 200 })),
+      );
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: ['http://a:8761/eureka', 'http://b:8762/eureka'],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+          requestTimeoutMs: 20,
+        }),
+      );
+
+      await expect(client.renew()).resolves.toBe('renewed');
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('multi-server failover', () => {
+    function twoServerClient(
+      urls: [string, string] = ['http://a:8761/eureka', 'http://b:8762/eureka'],
+    ): EurekaClient {
+      return new EurekaClient(
+        resolveOptions({
+          serviceUrl: urls,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+    }
+
+    it('fails over to the next server on a network error, then prefers it on the next call', async () => {
+      const client = twoServerClient();
+      fetchMock.mockImplementation((url: string) =>
+        url.includes('a:8761')
+          ? Promise.reject(new Error('ECONNREFUSED'))
+          : Promise.resolve(mockResponse({ ok: true, status: 200 })),
+      );
+
+      await expect(client.renew()).resolves.toBe('renewed');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [firstUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const [secondUrl] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(firstUrl).toContain('a:8761');
+      expect(secondUrl).toContain('b:8762');
+
+      fetchMock.mockClear();
+      await expect(client.renew()).resolves.toBe('renewed');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [thirdUrl] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(thirdUrl).toContain('b:8762');
+    });
+
+    it('fails over to the next server on a 5xx response', async () => {
+      const client = twoServerClient();
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: false, status: 503 })
+            : mockResponse({ ok: true, status: 200 }),
+        ),
+      );
+
+      await expect(client.renew()).resolves.toBe('renewed');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not fail over on a 4xx — a real answer from a reachable node — and does not move preferredIndex', async () => {
+      const client = twoServerClient();
+      // A (currently preferred) is retryable (503); B is terminal (400). If a
+      // bug updated preferredIndex on *any* attempt (including a throw), it
+      // would move to B (index 1) here — either from A's own 503 throw, or
+      // from B's 400 throw. The follow-up call proves neither happened.
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: false, status: 503 })
+            : mockResponse({ ok: false, status: 400 }),
+        ),
+      );
+
+      await expect(client.register()).rejects.toMatchObject({ status: 400 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      fetchMock.mockClear();
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(mockResponse({ ok: true, status: 204 })),
+      );
+      await client.register();
+      // preferredIndex is still A — neither A's 503 nor B's 400 (both thrown
+      // errors) moved it.
+      const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toContain('a:8761');
+    });
+
+    it('renew() 404 counts as a definitive answer — no failover, and it sets that server preferred', async () => {
+      const client = twoServerClient();
+      // A (currently preferred) is retryable (503); B answers 404 — a
+      // definitive "not-found" *return*, not a throw, ending the loop there.
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: false, status: 503 })
+            : mockResponse({ ok: false, status: 404 }),
+        ),
+      );
+      await expect(client.renew()).resolves.toBe('not-found');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // The next call starts at B, not the default A — proving specifically
+      // that the 404 *return* (not the prior 503 throw) moved preferredIndex.
+      fetchMock.mockClear();
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(mockResponse({ ok: true, status: 200 })),
+      );
+      await client.renew();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toContain('b:8762');
+    });
+
+    it('a malformed discovery response (reachable, bad data) does not fail over', async () => {
+      const client = twoServerClient();
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({
+                ok: true,
+                status: 200,
+                json: () => Promise.reject(new Error('bad json')),
+              })
+            : mockResponse({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ application: { instance: [] } }),
+              }),
+        ),
+      );
+
+      const error = await client
+        .getInstances('other-app')
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1); // B never contacted
+    });
+
+    it("throws the last server's error when all servers fail, having tried each exactly once", async () => {
+      const client = twoServerClient();
+      fetchMock
+        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
+        .mockImplementationOnce(() => Promise.reject(new Error('b down')));
+
+      const error = await client.renew().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect(((error as EurekaRequestError).cause as Error).message).toBe(
+        'b down',
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('deregister() fails over on a network error, with no caller signal involved', async () => {
+      const client = twoServerClient();
+      fetchMock
+        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
+        .mockImplementationOnce(() =>
+          Promise.resolve(mockResponse({ ok: true, status: 200 })),
+        );
+
+      await expect(client.deregister()).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('getInstances() fails over on a 5xx response', async () => {
+      const client = twoServerClient();
+      fetchMock
+        .mockImplementationOnce(() =>
+          Promise.resolve(mockResponse({ ok: false, status: 503 })),
+        )
+        .mockImplementationOnce(() =>
+          Promise.resolve(
+            mockResponse({
+              ok: true,
+              status: 200,
+              json: () => Promise.resolve({ application: { instance: [] } }),
+            }),
+          ),
+        );
+
+      await expect(client.getInstances('other-app')).resolves.toEqual([]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("builds each attempt's URL and Authorization header from the same server entry — never mixes credentials", async () => {
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: [
+            'http://alice:a-secret@a:8761/eureka',
+            'http://bob:b-secret@b:8762/eureka',
+          ],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: false, status: 503 })
+            : mockResponse({ ok: true, status: 200 }),
+        ),
+      );
+
+      await expect(client.renew()).resolves.toBe('renewed');
+
+      const [firstCall, secondCall] = fetchMock.mock.calls as [
+        string,
+        RequestInit,
+      ][];
+      const authA = (firstCall[1].headers as Record<string, string>)
+        .Authorization;
+      const authB = (secondCall[1].headers as Record<string, string>)
+        .Authorization;
+      expect(authA).toBe(
+        `Basic ${Buffer.from('alice:a-secret').toString('base64')}`,
+      );
+      expect(authB).toBe(
+        `Basic ${Buffer.from('bob:b-secret').toString('base64')}`,
+      );
+      expect(firstCall[0]).not.toContain('alice');
+      expect(firstCall[0]).not.toContain('a-secret');
+      expect(secondCall[0]).not.toContain('bob');
+      expect(secondCall[0]).not.toContain('b-secret');
+    });
   });
 });

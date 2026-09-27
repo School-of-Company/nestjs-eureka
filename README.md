@@ -46,7 +46,7 @@ For deregistration to run on a clean shutdown (SIGTERM/SIGINT), call `app.enable
 
 | Option | Required | Default | Notes |
 |---|---|---|---|
-| `serviceUrl` | yes | — | A single Eureka base URL, e.g. `http://localhost:8761/eureka`. Basic-auth credentials embedded in the URL (`http://user:pass@host/eureka`) are supported and are converted into an `Authorization` header — never passed to `fetch` as part of the URL. Multiple Eureka server URLs (e.g. Spring's comma-joined `defaultZone` convention) aren't supported yet and are rejected with a clear error rather than silently mis-parsed (tracked in [#6](https://github.com/School-of-Company/nestjs-eureka/issues/6)). |
+| `serviceUrl` | yes | — | One Eureka base URL, or an array of several for failover, e.g. `http://localhost:8761/eureka` or `['http://a:8761/eureka', 'http://b:8761/eureka']`. Basic-auth credentials embedded in a URL (`http://user:pass@host/eureka`) are supported and are converted into an `Authorization` header — never passed to `fetch` as part of the URL; each URL in an array has its own independent credentials. A comma-joined multi-URL string (e.g. Spring's `defaultZone` convention) is **not** supported and is rejected with a clear error — pass an array instead. See [Failover across multiple servers](#failover-across-multiple-servers). |
 | `instance.app` | yes | — | The application/service name. Uppercased for the Eureka wire protocol; the discovery API reflects Eureka's own normalized value, not necessarily your original casing. |
 | `instance.hostName` | yes | — | |
 | `instance.ipAddr` | yes | — | |
@@ -105,10 +105,26 @@ On application bootstrap, `EurekaService` registers the configured instance with
 - **`registrationMode: 'background'` lets the app boot anyway.** A failed initial registration is logged as a warning, bootstrap continues, and the heartbeat loop keeps retrying every `heartbeatIntervalSeconds` (no backoff) until Eureka accepts the instance. Until then the service runs but is **not discoverable** by other services. Each retry is a heartbeat first: if the earlier registration actually reached Eureka (e.g. only its response timed out), the heartbeat succeeds and no second registration is sent; if Eureka answers 404, re-registration is attempted (and retried on the next heartbeat if it fails). If shutdown happens while a registration attempt is still in flight, see the next bullet — its outcome is treated as unknown, and a best-effort deregistration is sent either way.
 - **Heartbeat 404 triggers re-registration.** If a heartbeat gets a 404 (Eureka no longer has the instance — e.g. after a Eureka server restart), the library re-registers once and keeps heartbeating. If that one-shot re-registration itself fails, it's logged and retried on the next heartbeat tick — the loop never stops because of this.
 - **Every Eureka request has a timeout**, `requestTimeoutMs` (default 5000ms).
-- **Shutdown aborts the in-flight heartbeat/registration request** rather than waiting for it to settle or time out, then performs at most one deregistration request, bounded by `requestTimeoutMs`. Cancellation is best-effort — it depends on `fetch` honoring `AbortSignal`, not a strict timing guarantee. If the aborted call was a registration whose outcome is unknown (Eureka may have already applied it before the cancellation reached the client), shutdown still sends a best-effort deregistration — a `DELETE` for an instance Eureka never actually registered is treated as a harmless no-op.
+- **Shutdown aborts the in-flight heartbeat/registration request** rather than waiting for it to settle or time out, then performs at most one deregistration attempt *per configured server* (see [Failover across multiple servers](#failover-across-multiple-servers)) — with a single server (the default) that's bounded by `requestTimeoutMs`; with several, deregistration itself can fail over too, up to `requestTimeoutMs` per server tried. Cancellation is best-effort — it depends on `fetch` honoring `AbortSignal`, not a strict timing guarantee. If the aborted call was a registration whose outcome is unknown (Eureka may have already applied it before the cancellation reached the client), shutdown still sends a best-effort deregistration — a `DELETE` for an instance Eureka never actually registered is treated as a harmless no-op.
 - **Deregistration runs on shutdown**, via Nest's `beforeApplicationShutdown` hook. This hook fires on `app.close()` regardless of `enableShutdownHooks()`. What `app.enableShutdownHooks()` adds is Nest listening for OS signals (SIGTERM/SIGINT) and calling `app.close()` for you — without it, if your process is killed by a signal, Nest's shutdown hooks (and therefore deregistration) never run, and the instance stays registered in Eureka until its lease expires (`leaseDurationSeconds`, default 90s). Call `app.enableShutdownHooks()` if you want a clean deregistration on a normal container/orchestrator shutdown signal.
-- Deregistration is idempotent — shutting down more than once never sends more than one `DELETE`, and never throws.
+- Deregistration is idempotent — shutting down more than once never sends more than one deregistration attempt (or attempt sequence, with multiple servers), and never throws.
 - **This library only controls its own hook.** If *another* provider's shutdown hook rejects during `app.close()`, Nest can abort the shutdown sequence before `beforeApplicationShutdown` runs for every provider — in that case deregistration may not happen, and the instance stays registered until its lease expires. This is a property of how Nest's own shutdown sequencing works, not something this library can control.
+
+## Failover across multiple servers
+
+Pass an array to `serviceUrl` to configure more than one Eureka server:
+
+```ts
+EurekaModule.forRoot({
+  serviceUrl: ['http://eureka-a:8761/eureka', 'http://eureka-b:8761/eureka'],
+  instance: { app: 'my-service', hostName: 'host-1', ipAddr: '10.0.0.1', port: 3000 },
+});
+```
+
+- **A network error, timeout, or 5xx response fails over to the next server** — that server is treated as broken. **A 4xx response never fails over** — it's a real answer from a reachable node (e.g. a malformed request), not evidence the node is down.
+- **The server that last completed a call successfully is preferred on the next call** — a 2xx, or a meaningful 404 for renew/deregister/discovery. A terminal 4xx doesn't change the preference; only a real success does. Once a server becomes preferred, it's used for every subsequent call until *it* fails — there's no periodic re-probing of an earlier server, and no load balancing across always-healthy nodes; this is failover/redundancy only. Concurrent calls (e.g. discovery running alongside a heartbeat) can each update this independently — it's a best-effort ordering hint, not a strict guarantee.
+- **An intentional shutdown never fails over.** If `stop()`'s cancellation (see [Service registration](#service-registration)) is what aborted the in-flight call, that's propagated immediately — there's no point trying another server while shutting down.
+- Recovering after a server goes down still goes through the same heartbeat-404-then-re-register path described above: a heartbeat that fails over to a server which has never seen this instance gets a 404 back (a real answer, not a failure), which triggers the existing re-registration logic against that now-preferred server.
 
 ## Service discovery
 
