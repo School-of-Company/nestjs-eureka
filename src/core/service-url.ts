@@ -17,7 +17,29 @@ export interface ParsedServiceUrl {
 
 const INVALID_URL_MESSAGE = 'Invalid Eureka service URL';
 
+// Matches a comma, semicolon, or whitespace (a space, or a newline — as in a
+// multiline YAML/env value) directly followed by another http(s) URL —
+// deliberately narrower than "any comma/semicolon/whitespace anywhere" so a
+// legitimate single URL whose *password* happens to contain one of those
+// characters isn't falsely rejected (WHATWG URL parsing never treats
+// userinfo commas/semicolons specially — `pa,ss` in
+// `http://user:pa,ss@host/eureka` parses fine, with none of it reaching
+// `pathname`). Catches credential-free multi-URL joins regardless of which
+// separator convention was used (Spring's `defaultZone` uses a comma, but a
+// newline or space is just as easy to end up with by accident).
+const JOINED_MULTI_URL = /[,;\s]\s*https?:\/\//i;
+
 export function parseServiceUrl(serviceUrl: string): ParsedServiceUrl {
+  // Checked on the raw input, before `new URL()` ever runs, so a credentialed
+  // second URL's password can't leak into anything derived from a `URL`
+  // object. Multiple servers ARE supported (see `options.ts`'s
+  // `serviceUrl: string[]`) — just not via a joined single-string convention.
+  if (JOINED_MULTI_URL.test(serviceUrl)) {
+    throw new Error(
+      `${INVALID_URL_MESSAGE}: joining multiple server URLs into one string is not supported — pass an array of URLs instead`,
+    );
+  }
+
   let url: URL;
   try {
     url = new URL(serviceUrl);
@@ -35,16 +57,16 @@ export function parseServiceUrl(serviceUrl: string): ParsedServiceUrl {
     );
   }
   if (url.pathname.includes('@')) {
-    // A comma-joined multi-URL input (e.g. Spring's `defaultZone` convention,
-    // `http://u1:p1@host-a/eureka/,http://u2:secret@host-b/eureka/`) must be
-    // *rejected*, not silently mis-parsed: `new URL()` only recognizes the
-    // first `user:pass@host` as credentials and treats the rest as a literal
-    // path, which would otherwise leak the second URL's credentials into
-    // every request path, `EurekaRequestError.url`, and log lines. Multiple
-    // servers ARE supported (see `options.ts`'s `serviceUrl: string[]`) —
-    // just not via this comma-joined single-string convention.
+    // A second, credentialed URL joined by *any* separator — not just a
+    // comma; a newline (e.g. from a multiline YAML/env value), a space, a
+    // semicolon, etc. — ends up with `user:pass@host` landing in the parsed
+    // pathname as a literal string, since `new URL()` only recognizes the
+    // FIRST `@` as the userinfo delimiter. The comma-specific check above
+    // doesn't (and shouldn't) catch these; this one does, regardless of
+    // separator. Don't remove this thinking the check above makes it
+    // redundant — it isn't.
     throw new Error(
-      `${INVALID_URL_MESSAGE}: a comma-joined multi-server URL is not supported — pass an array of URLs instead`,
+      `${INVALID_URL_MESSAGE}: joining multiple server URLs into one string is not supported — pass an array of URLs instead`,
     );
   }
 

@@ -73,8 +73,83 @@ describe('parseServiceUrl', () => {
     expect(error).toBeDefined();
     expect(error!.message).not.toContain('secret2');
     expect(error!.message).toBe(
-      'Invalid Eureka service URL: a comma-joined multi-server URL is not supported — pass an array of URLs instead',
+      'Invalid Eureka service URL: joining multiple server URLs into one string is not supported — pass an array of URLs instead',
     );
+  });
+
+  it('rejects a comma-joined multi-URL input even without embedded credentials (regression)', () => {
+    // The common case in practice (e.g. Spring's `defaultZone` convention
+    // usually has no basic-auth) — this has no "@" anywhere, so a check that
+    // only looked at `pathname.includes('@')` would silently accept it as
+    // one garbled URL instead of rejecting it.
+    expect(() =>
+      parseServiceUrl('http://host-a:8761/eureka/,http://host-b:8761/eureka/'),
+    ).toThrow(
+      'Invalid Eureka service URL: joining multiple server URLs into one string is not supported — pass an array of URLs instead',
+    );
+  });
+
+  it('rejects a comma-joined multi-URL input with surrounding whitespace after the comma', () => {
+    expect(() =>
+      parseServiceUrl('http://host-a:8761/eureka, http://host-b:8761/eureka'),
+    ).toThrow(/joining multiple server URLs into one string is not supported/);
+  });
+
+  it('rejects a credential-free multi-URL input joined by a non-comma separator (newline/space/semicolon) (regression)', () => {
+    // Same root cause as the comma case above: without credentials there's
+    // no "@" for the post-parse pathname check to catch, so the raw-input
+    // check must itself cover every separator someone might accidentally
+    // join URLs with, not just a comma.
+    const inputs = [
+      'http://host-a:8761/eureka/\nhttp://host-b:8761/eureka/',
+      'http://host-a:8761/eureka/ http://host-b:8761/eureka/',
+      'http://host-a:8761/eureka/;http://host-b:8761/eureka/',
+    ];
+    for (const input of inputs) {
+      expect(() => parseServiceUrl(input)).toThrow(
+        'Invalid Eureka service URL: joining multiple server URLs into one string is not supported — pass an array of URLs instead',
+      );
+    }
+  });
+
+  it('rejects a comma-joined multi-URL input regardless of scheme case or http vs https', () => {
+    expect(() =>
+      parseServiceUrl('http://host-a:8761/eureka,HTTP://host-b:8761/eureka'),
+    ).toThrow(/joining multiple server URLs into one string is not supported/);
+    expect(() =>
+      parseServiceUrl('http://host-a:8761/eureka,https://host-b:8761/eureka'),
+    ).toThrow(/joining multiple server URLs into one string is not supported/);
+  });
+
+  it('does not falsely reject a single URL whose password happens to contain a literal comma (regression)', () => {
+    const { baseUrl, authorizationHeader } = parseServiceUrl(
+      'http://user:pa,ss@localhost:8761/eureka',
+    );
+    expect(baseUrl).toBe('http://localhost:8761/eureka');
+    expect(authorizationHeader).toBe(
+      `Basic ${Buffer.from('user:pa,ss').toString('base64')}`,
+    );
+  });
+
+  it("rejects a credentialed multi-URL input joined by a non-comma separator (newline/space/semicolon) instead of leaking the second URL's credentials (regression)", () => {
+    const inputs = [
+      'http://u1:p1@host-a:8761/eureka/\nhttp://u2:secret2@host-b:8761/eureka/',
+      'http://u1:p1@host-a:8761/eureka/ http://u2:secret2@host-b:8761/eureka/',
+      'http://u1:p1@host-a:8761/eureka/;http://u2:secret2@host-b:8761/eureka/',
+    ];
+    for (const input of inputs) {
+      let error: Error | undefined;
+      try {
+        parseServiceUrl(input);
+      } catch (err) {
+        error = err as Error;
+      }
+      expect(error).toBeDefined();
+      expect(error!.message).not.toContain('secret2');
+      expect(error!.message).toBe(
+        'Invalid Eureka service URL: joining multiple server URLs into one string is not supported — pass an array of URLs instead',
+      );
+    }
   });
 
   it('rejects a non-http(s) scheme', () => {
