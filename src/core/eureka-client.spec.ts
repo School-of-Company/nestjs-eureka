@@ -226,22 +226,139 @@ describe('EurekaClient', () => {
     expect((error!.cause as Error).message).toContain('hunter2');
   });
 
-  it('aborts the request once the fixed request timeout elapses', async () => {
-    const controller = new AbortController();
-    jest.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal);
-    fetchMock.mockImplementation(
-      (_url: string, init: RequestInit) =>
-        new Promise((_resolve, reject) => {
-          init.signal?.addEventListener('abort', () =>
-            reject(new DOMException('The operation was aborted', 'AbortError')),
-          );
+  describe('timeout and cancellation', () => {
+    // Behaves like a real fetch that never gets a response: settles only when
+    // the request's signal aborts, with the signal's reason.
+    function hangingFetch(_url: string, init: RequestInit): Promise<Response> {
+      return new Promise((_resolve, reject) => {
+        const signal = init.signal!;
+        if (signal.aborted) return reject(signal.reason as Error);
+        signal.addEventListener('abort', () => reject(signal.reason as Error), {
+          once: true,
+        });
+      });
+    }
+
+    function clientWithTimeout(requestTimeoutMs: number): EurekaClient {
+      return new EurekaClient(
+        resolveOptions({
+          serviceUrl: 'http://localhost:8761/eureka',
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+          requestTimeoutMs,
         }),
+      );
+    }
+
+    it('uses the configured requestTimeoutMs for the timeout signal', async () => {
+      const timeoutSpy = jest.spyOn(AbortSignal, 'timeout');
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+
+      await clientWithTimeout(1234).renew();
+
+      expect(timeoutSpy).toHaveBeenCalledWith(1234);
+    });
+
+    it('a hanging request rejects with EurekaRequestError once requestTimeoutMs elapses', async () => {
+      fetchMock.mockImplementation(hangingFetch);
+
+      const error = await clientWithTimeout(20)
+        .renew()
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).operation).toBe('renew');
+      expect(((error as EurekaRequestError).cause as Error).name).toBe(
+        'TimeoutError',
+      );
+    });
+
+    it.each(['register', 'renew'] as const)(
+      '%s(): a caller abort rejects well before a long requestTimeoutMs',
+      async (operation) => {
+        fetchMock.mockImplementation(hangingFetch);
+        const controller = new AbortController();
+        const client = clientWithTimeout(60_000);
+
+        const started = Date.now();
+        const pending = client[operation](controller.signal).catch(
+          (e: unknown) => e,
+        );
+        controller.abort();
+        const error = await pending;
+
+        expect(Date.now() - started).toBeLessThan(1_000);
+        expect(error).toBeInstanceOf(EurekaRequestError);
+        expect((error as EurekaRequestError).operation).toBe(operation);
+        expect(((error as EurekaRequestError).cause as Error).name).toBe(
+          'AbortError',
+        );
+      },
     );
-    const client = new EurekaClient(resolved);
 
-    const pending = client.renew();
-    controller.abort();
+    it('a caller signal that never aborts does not suppress the timeout (both signals are truly combined)', async () => {
+      fetchMock.mockImplementation(hangingFetch);
+      // Never aborted — present only to prove the timeout still fires when
+      // composed with a live caller signal, not just when one is absent.
+      const controller = new AbortController();
 
-    await expect(pending).rejects.toBeInstanceOf(EurekaRequestError);
+      const error = await clientWithTimeout(20)
+        .renew(controller.signal)
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect(((error as EurekaRequestError).cause as Error).name).toBe(
+        'TimeoutError',
+      );
+    });
+
+    it('an already-aborted caller signal rejects cleanly (async) as EurekaRequestError', async () => {
+      fetchMock.mockImplementation(hangingFetch);
+      const controller = new AbortController();
+      controller.abort();
+
+      let pending: Promise<unknown> | undefined;
+      expect(() => {
+        pending = clientWithTimeout(60_000).register(controller.signal);
+      }).not.toThrow();
+
+      await expect(pending).rejects.toBeInstanceOf(EurekaRequestError);
+    });
+
+    it('deregister() and getInstances() never compose a caller signal (no AbortSignal.any call, timeout signal used as-is)', async () => {
+      const anySpy = jest.spyOn(AbortSignal, 'any');
+      fetchMock.mockResolvedValue(
+        mockResponse({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              application: {
+                instance: {
+                  instanceId: 'i',
+                  app: 'OTHER-APP',
+                  hostName: 'h',
+                  ipAddr: '1.2.3.4',
+                  status: 'UP',
+                },
+              },
+            }),
+        }),
+      );
+      const client = clientWithTimeout(60_000);
+
+      await client.deregister();
+      await client.getInstances('other-app');
+
+      expect(anySpy).not.toHaveBeenCalled();
+      for (const [, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+        expect(init.signal!.aborted).toBe(false);
+      }
+    });
   });
 });

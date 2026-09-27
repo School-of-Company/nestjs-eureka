@@ -6,8 +6,6 @@ import {
 } from './instance';
 import type { ResolvedEurekaOptions } from './options';
 
-const REQUEST_TIMEOUT_MS = 5_000;
-
 export type RenewResult = 'renewed' | 'not-found';
 
 /**
@@ -17,19 +15,33 @@ export type RenewResult = 'renewed' | 'not-found';
 export class EurekaClient {
   constructor(private readonly resolved: ResolvedEurekaOptions) {}
 
-  async register(): Promise<void> {
+  /** `signal` lets the caller cancel the request early, on top of `requestTimeoutMs`. */
+  async register(signal?: AbortSignal): Promise<void> {
     const url = this.appUrl(this.resolved.instance.eurekaAppName);
-    const response = await this.rawFetch('register', 'POST', url, {
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildRegistrationBody(this.resolved)),
-    });
+    const response = await this.rawFetch(
+      'register',
+      'POST',
+      url,
+      {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildRegistrationBody(this.resolved)),
+      },
+      signal,
+    );
     await this.drain(response);
     if (!response.ok) throw this.statusError('register', 'POST', url, response);
   }
 
-  async renew(): Promise<RenewResult> {
+  /** `signal` lets the caller cancel the request early, on top of `requestTimeoutMs`. */
+  async renew(signal?: AbortSignal): Promise<RenewResult> {
     const url = this.instanceUrl();
-    const response = await this.rawFetch('renew', 'PUT', url);
+    const response = await this.rawFetch(
+      'renew',
+      'PUT',
+      url,
+      undefined,
+      signal,
+    );
     await this.drain(response);
     if (response.status === 200) return 'renewed';
     if (response.status === 404) return 'not-found';
@@ -100,6 +112,7 @@ export class EurekaClient {
     method: string,
     url: string,
     init?: { headers?: Record<string, string>; body?: string },
+    callerSignal?: AbortSignal,
   ): Promise<Response> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -109,11 +122,14 @@ export class EurekaClient {
       headers.Authorization = this.resolved.authorizationHeader;
 
     try {
+      const timeoutSignal = AbortSignal.timeout(this.resolved.requestTimeoutMs);
       return await fetch(url, {
         method,
         headers,
         body: init?.body,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: callerSignal
+          ? AbortSignal.any([timeoutSignal, callerSignal])
+          : timeoutSignal,
       });
     } catch (cause) {
       throw new EurekaRequestError(`Eureka ${operation} request failed`, {

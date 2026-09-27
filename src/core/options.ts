@@ -37,6 +37,8 @@ export interface EurekaClientOptions {
    * and registration is retried on the heartbeat schedule until it succeeds.
    */
   registrationMode?: 'fail-fast' | 'background';
+  /** Default 5000. Timeout for each individual Eureka HTTP request, in milliseconds. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -50,6 +52,7 @@ export interface ResolvedEurekaOptions {
   heartbeatIntervalMs: number;
   leaseDurationSeconds: number;
   registrationMode: 'fail-fast' | 'background';
+  requestTimeoutMs: number;
   instance: {
     /** The Eureka application name, uppercased — used for the path and the body's `app` field. */
     eurekaAppName: string;
@@ -181,6 +184,10 @@ export function resolveOptions(
     heartbeatIntervalMs: heartbeatIntervalSeconds * 1000,
     leaseDurationSeconds,
     registrationMode,
+    requestTimeoutMs: requirePositiveInteger(
+      options.requestTimeoutMs ?? 5_000,
+      'requestTimeoutMs',
+    ),
     instance: {
       eurekaAppName: app.toUpperCase(),
       instanceId,

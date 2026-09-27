@@ -40,7 +40,7 @@ export class EurekaService
     await this.registration.start();
   }
 
-  /** Deregisters from Eureka. Never rejects; safe to run more than once. */
+  /** Cancels any in-flight registration/heartbeat, then deregisters from Eureka. Never rejects; safe to run more than once. */
   async beforeApplicationShutdown(): Promise<void> {
     await this.registration.stop();
   }

@@ -100,6 +100,22 @@ describe('EurekaService (Nest lifecycle wiring)', () => {
     expect(deleteCalls).toHaveLength(0);
   });
 
+  it('applies requestTimeoutMs to the requests it makes', async () => {
+    const timeoutSpy = jest.spyOn(AbortSignal, 'timeout');
+    fetchMock.mockResolvedValue(mockResponse(true, 204));
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [
+        EurekaModule.forRoot({ ...validOptions(), requestTimeoutMs: 2_500 }),
+      ],
+    }).compile();
+
+    await moduleRef.init();
+    await moduleRef.close();
+
+    expect(timeoutSpy).toHaveBeenCalledWith(2_500);
+    expect(timeoutSpy).not.toHaveBeenCalledWith(5_000);
+  });
+
   it('getInstances() delegates to the underlying client', async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(true, 204)); // register on init
     const moduleRef: TestingModule = await Test.createTestingModule({

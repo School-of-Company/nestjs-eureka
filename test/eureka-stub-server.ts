@@ -22,6 +22,12 @@ export class EurekaStubServer {
   readonly requests: RecordedRequest[] = [];
   /** When true, registration (POST) requests get a 503 and nothing is stored. */
   failRegistrations = false;
+  /** When true, renewal (PUT) requests never get a response — the request
+   *  hangs until the client cancels it (or the connection is force-closed). */
+  hangRenewals = false;
+  /** Incremented synchronously whenever a hanging renewal request arrives,
+   *  so a test can deterministically wait for one to actually be in flight. */
+  hangingRenewalCount = 0;
   private port = 0;
 
   constructor() {
@@ -41,6 +47,10 @@ export class EurekaStubServer {
   }
 
   async close(): Promise<void> {
+    // A hung/aborted renewal leaves its server-side socket open (the client
+    // cancelling its own request doesn't close the underlying TCP
+    // connection) — without this, server.close() would hang waiting for it.
+    this.server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
       this.server.close((err) => (err ? reject(err) : resolve())),
     );
@@ -95,6 +105,10 @@ export class EurekaStubServer {
       return;
     }
     if (method === 'PUT' && instanceId) {
+      if (this.hangRenewals) {
+        this.hangingRenewalCount++;
+        return; // deliberately never respond; the client is expected to cancel
+      }
       res.writeHead(this.registry.has(instanceId) ? 200 : 404).end();
       return;
     }

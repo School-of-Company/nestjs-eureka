@@ -23,6 +23,19 @@ describe('resolveOptions', () => {
     expect(resolved.instance.secureVipAddress).toBe('my-app');
     expect(resolved.instance.metadata).toEqual({});
     expect(resolved.registrationMode).toBe('fail-fast');
+    expect(resolved.requestTimeoutMs).toBe(5_000);
+  });
+
+  it('accepts a custom requestTimeoutMs', () => {
+    const options = baseOptions();
+    options.requestTimeoutMs = 1_500;
+    expect(resolveOptions(options).requestTimeoutMs).toBe(1_500);
+  });
+
+  it.each([0, -1, 1.5])('rejects requestTimeoutMs %p', (value) => {
+    const options = baseOptions();
+    options.requestTimeoutMs = value;
+    expect(() => resolveOptions(options)).toThrow(/requestTimeoutMs/);
   });
 
   it('accepts registrationMode "background"', () => {
