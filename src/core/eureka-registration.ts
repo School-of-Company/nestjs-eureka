@@ -1,17 +1,18 @@
 import type { EurekaClient } from './eureka-client';
 import type { EurekaLogger } from './logger';
+import type { ResolvedEurekaOptions } from './options';
 
 type State = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
 
 /**
  * Lifecycle state machine for a single Eureka registration: register once,
  * heartbeat on a schedule, re-register on a 404 heartbeat response,
- * deregister on shutdown. No NestJS dependency — see `.claude/rules/architecture.md`.
+ * deregister on shutdown. No NestJS dependency.
  *
- * `stopped` is a terminal state: once reached (whether via a failed initial
- * `start()` or a completed `stop()`), this instance cannot be restarted —
- * construct a new one instead. This matches the library's fail-fast startup
- * contract.
+ * `stopped` is a terminal state: once reached (via a failed initial `start()`
+ * in fail-fast mode, or a completed `stop()`), this instance cannot be
+ * restarted — construct a new one instead. In background mode, `start()`
+ * never fails because of a registration error.
  */
 export class EurekaRegistration {
   private state: State = 'idle';
@@ -27,12 +28,15 @@ export class EurekaRegistration {
     private readonly client: EurekaClient,
     private readonly heartbeatIntervalMs: number,
     private readonly logger: EurekaLogger,
+    private readonly registrationMode: ResolvedEurekaOptions['registrationMode'],
   ) {}
 
   /**
-   * Registers with Eureka and starts the heartbeat loop. Rejects with the
-   * original registration error on failure (fail-fast) — the caller (Nest's
-   * `onApplicationBootstrap`) is expected to let that fail application boot.
+   * Registers with Eureka and starts the heartbeat loop. In fail-fast mode,
+   * rejects with the original registration error on failure — the caller
+   * (Nest's `onApplicationBootstrap`) is expected to let that fail
+   * application boot. In background mode, a failed registration is logged
+   * and retried by the heartbeat loop, and this resolves anyway.
    */
   start(): Promise<void> {
     if (this.state === 'running') return Promise.resolve();
@@ -58,10 +62,26 @@ export class EurekaRegistration {
         this.state = 'running';
         this.scheduleHeartbeat();
       } catch (error) {
-        // Only claim the `stopped` transition if it's still ours to claim —
-        // stop() is the only path allowed to move `stopping -> stopped`.
-        if (this.state === 'starting') this.state = 'stopped';
-        throw error; // the original start() caller always sees this
+        if (this.registrationMode === 'fail-fast') {
+          // Only claim the `stopped` transition if it's still ours to claim —
+          // stop() is the only path allowed to move `stopping -> stopped`.
+          if (this.state === 'starting') this.state = 'stopped';
+          throw error; // the original start() caller always sees this
+        }
+        // Background mode: never reject. If stop() already landed, it owns
+        // the transition and sees `registered === false` (no DELETE).
+        if (this.state !== 'starting') return;
+        this.logger.warn(
+          `Eureka initial registration failed; retrying every ${this.heartbeatIntervalMs / 1000}s in the background: ${(error as Error).message}`,
+        );
+        this.state = 'running';
+        // Retries deliberately go through the normal heartbeat tick
+        // (renew first, register only on 404) rather than calling register()
+        // directly: a failed POST may still have succeeded server-side (e.g.
+        // the response timed out), and a successful renew is what proves
+        // that and restores `registered = true`. Don't "simplify" this into
+        // a direct register() retry or a second timer.
+        this.scheduleHeartbeat();
       }
     })();
     this.pendingOperation = operation;
@@ -115,18 +135,16 @@ export class EurekaRegistration {
   private async tick(): Promise<void> {
     try {
       const result = await this.client.renew();
+      // Record what the server just told us *before* checking whether stop()
+      // landed during the renew — stop() reads `registered` right after this
+      // settles. 'renewed' proves the server has our lease even if an earlier
+      // register (the initial one in background mode, or a previous tick's
+      // re-register below) failed client-side after succeeding server-side;
+      // 'not-found' proves it doesn't. Either way stop() then sends a DELETE
+      // exactly when one is owed.
+      this.registered = result === 'renewed';
       if (this.state !== 'running') return; // stop() may have landed during the renew call
-      if (result === 'renewed') {
-        // A successful renew is itself proof the server currently has our
-        // lease — restate it even if a previous tick's one-shot re-register
-        // (below) had failed client-side (e.g. timed out) after actually
-        // succeeding server-side. Without this, `registered` could get stuck
-        // `false` forever and `stop()` would skip a DELETE that was owed.
-        this.registered = true;
-      } else {
-        // Eureka no longer has us — reflect that immediately, independent of
-        // whether the one-shot re-register below succeeds.
-        this.registered = false;
+      if (result === 'not-found') {
         this.logger.warn(
           'Eureka heartbeat returned 404 (instance not found); re-registering',
         );
@@ -144,7 +162,9 @@ export class EurekaRegistration {
         if (this.state !== 'running') return; // stop() may have landed during the re-register call
       }
     } catch (error) {
-      // Network/timeout/5xx on renew: log and keep the schedule (no backoff in v1).
+      // Network/timeout/5xx on renew: log and keep the schedule (no backoff).
+      // `registered` is deliberately left untouched — only an explicit 404
+      // proves Eureka doesn't know this instance.
       this.logger.warn(`Eureka heartbeat failed: ${(error as Error).message}`);
     } finally {
       if (this.state === 'running') this.scheduleHeartbeat();

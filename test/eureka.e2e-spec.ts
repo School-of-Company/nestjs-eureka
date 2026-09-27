@@ -82,4 +82,52 @@ describe('Eureka registration (e2e)', () => {
     const deleteRequests = stub.requests.filter((r) => r.method === 'DELETE');
     expect(deleteRequests).toHaveLength(1);
   }, 20_000);
+
+  it('background mode: boots while Eureka rejects registration, registers once Eureka recovers, and deregisters exactly once', async () => {
+    const instanceId = 'host-1:my-app:3000';
+    stub.failRegistrations = true;
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: stub.url,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+            instanceId,
+          },
+          heartbeatIntervalSeconds: 1,
+          leaseDurationSeconds: 3,
+          registrationMode: 'background',
+        }),
+      ],
+    })
+    class TestModule {}
+
+    const appContext = await NestFactory.createApplicationContext(TestModule, {
+      logger: false,
+    });
+
+    try {
+      expect(stub.requests.filter((r) => r.method === 'POST')).toHaveLength(1);
+
+      stub.failRegistrations = false;
+      await waitFor(
+        () => stub.requests.filter((r) => r.method === 'POST').length >= 2,
+        5000,
+      );
+
+      const service = appContext.get(EurekaService);
+      const instances = await service.getInstances('my-app');
+      expect(instances).toHaveLength(1);
+      expect(instances[0].instanceId).toBe(instanceId);
+    } finally {
+      await appContext.close();
+    }
+
+    const deleteRequests = stub.requests.filter((r) => r.method === 'DELETE');
+    expect(deleteRequests).toHaveLength(1);
+  }, 20_000);
 });

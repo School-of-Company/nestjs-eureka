@@ -22,6 +22,19 @@ describe('resolveOptions', () => {
     expect(resolved.instance.vipAddress).toBe('my-app');
     expect(resolved.instance.secureVipAddress).toBe('my-app');
     expect(resolved.instance.metadata).toEqual({});
+    expect(resolved.registrationMode).toBe('fail-fast');
+  });
+
+  it('accepts registrationMode "background"', () => {
+    const options = baseOptions();
+    options.registrationMode = 'background';
+    expect(resolveOptions(options).registrationMode).toBe('background');
+  });
+
+  it('rejects an unknown registrationMode', () => {
+    const options = baseOptions();
+    options.registrationMode = 'lazy' as unknown as 'background';
+    expect(() => resolveOptions(options)).toThrow(/registrationMode/);
   });
 
   it('does not mutate the caller-supplied options or its nested objects', () => {

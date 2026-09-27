@@ -31,10 +31,11 @@ export class EurekaService
       this.client,
       resolved.heartbeatIntervalMs,
       new Logger(EurekaService.name),
+      resolved.registrationMode,
     );
   }
 
-  /** Registers with Eureka. Rejects (failing app boot) if the initial registration fails — see the README. */
+  /** Registers with Eureka. In fail-fast mode (the default), rejects (failing app boot) if the initial registration fails — see the README. */
   async onApplicationBootstrap(): Promise<void> {
     await this.registration.start();
   }
