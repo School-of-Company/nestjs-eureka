@@ -174,4 +174,81 @@ describe('Eureka registration (e2e)', () => {
     const deleteRequests = stub.requests.filter((r) => r.method === 'DELETE');
     expect(deleteRequests).toHaveLength(1);
   }, 20_000);
+
+  it('fails over to a second, independent Eureka server when the first goes down, recovering via the existing 404-triggered re-register path', async () => {
+    const instanceId = 'host-1:my-app:3000';
+    // Two fully independent stub servers — B has never heard of this
+    // instance, exactly like an unrelated real Eureka node would be.
+    const serverA = new EurekaStubServer();
+    const serverB = new EurekaStubServer();
+    await serverA.listen();
+    await serverB.listen();
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: [serverA.url, serverB.url],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+            instanceId,
+          },
+          heartbeatIntervalSeconds: 1,
+          leaseDurationSeconds: 3,
+        }),
+      ],
+    })
+    class TestModule {}
+
+    const appContext = await NestFactory.createApplicationContext(TestModule, {
+      logger: false,
+    });
+
+    try {
+      // Initial registration lands on A (the default preferred server).
+      await waitFor(() => serverA.requests.some((r) => r.method === 'POST'));
+      expect(serverA.requests.filter((r) => r.method === 'POST')).toHaveLength(
+        1,
+      );
+      // Let at least one heartbeat succeed against A before taking it down,
+      // so this is a genuine mid-flight failover, not a lucky race.
+      await waitFor(() => serverA.requests.some((r) => r.method === 'PUT'));
+
+      await serverA.close();
+
+      // Recovery path: the next heartbeat's PUT to (dead) A fails at the
+      // transport level and fails over to B; B has never seen this instance,
+      // so it answers 404 — the same "not-found" result the single-server
+      // 404 test already exercises — which re-registers (POST) on B, now the
+      // preferred server, and later heartbeats (PUT) against B succeed.
+      await waitFor(
+        () => serverB.requests.filter((r) => r.method === 'PUT').length >= 2,
+        10_000,
+      );
+      const methods = serverB.requests.map((r) => r.method);
+      const firstPut = methods.indexOf('PUT');
+      const post = methods.indexOf('POST');
+      const secondPut = methods.indexOf('PUT', post + 1);
+      expect(firstPut).toBeGreaterThanOrEqual(0);
+      expect(post).toBeGreaterThan(firstPut);
+      expect(secondPut).toBeGreaterThan(post);
+
+      const service = appContext.get(EurekaService);
+      const instances = await service.getInstances('my-app');
+      expect(instances).toHaveLength(1);
+      expect(instances[0].instanceId).toBe(instanceId);
+    } finally {
+      await appContext.close();
+      // Both close() calls are idempotent — safe even though serverA was
+      // already closed above (and even if an assertion threw before that).
+      await serverA.close();
+      await serverB.close();
+    }
+
+    expect(serverB.requests.filter((r) => r.method === 'DELETE')).toHaveLength(
+      1,
+    );
+  }, 20_000);
 });

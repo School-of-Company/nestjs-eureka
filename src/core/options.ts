@@ -1,4 +1,4 @@
-import { parseServiceUrl } from './service-url';
+import { parseServiceUrl, type ParsedServiceUrl } from './service-url';
 
 /** Public: the instance metadata registered with Eureka. */
 export interface EurekaInstanceOptions {
@@ -25,7 +25,14 @@ export interface EurekaInstanceOptions {
  * `nest/eureka.interfaces.ts`. Don't re-export this type name from `index.ts`.
  */
 export interface EurekaClientOptions {
-  serviceUrl: string;
+  /**
+   * One Eureka server URL, or several for failover. On a network
+   * error/timeout or a 5xx response, the next URL is tried; a 4xx (a real
+   * answer from a reachable node, not a broken one) is not retried. The
+   * server that last completed a call successfully (not merely "answered")
+   * is preferred on the next call — a terminal 4xx doesn't change this.
+   */
+  serviceUrl: string | string[];
   instance: EurekaInstanceOptions;
   /** Default 30. Must be smaller than `leaseDurationSeconds`. */
   heartbeatIntervalSeconds?: number;
@@ -47,8 +54,8 @@ export interface EurekaClientOptions {
  * reachable from a public type or getter.
  */
 export interface ResolvedEurekaOptions {
-  baseUrl: string;
-  authorizationHeader?: string;
+  /** Always at least one entry. */
+  serviceUrls: ParsedServiceUrl[];
   heartbeatIntervalMs: number;
   leaseDurationSeconds: number;
   registrationMode: 'fail-fast' | 'background';
@@ -130,12 +137,29 @@ function copyMetadata(
   return result;
 }
 
+function resolveServiceUrls(
+  serviceUrl: EurekaClientOptions['serviceUrl'],
+): ParsedServiceUrl[] {
+  const inputs = Array.isArray(serviceUrl) ? serviceUrl : [serviceUrl];
+  if (inputs.length === 0) {
+    throw new Error(
+      'Eureka configuration: "serviceUrl" must be a non-empty string or a non-empty array of strings',
+    );
+  }
+  return inputs.map((input, i) =>
+    parseServiceUrl(
+      requireNonEmptyString(
+        input,
+        Array.isArray(serviceUrl) ? `serviceUrl[${i}]` : 'serviceUrl',
+      ),
+    ),
+  );
+}
+
 export function resolveOptions(
   options: EurekaClientOptions,
 ): ResolvedEurekaOptions {
-  const { baseUrl, authorizationHeader } = parseServiceUrl(
-    requireNonEmptyString(options.serviceUrl, 'serviceUrl'),
-  );
+  const serviceUrls = resolveServiceUrls(options.serviceUrl);
 
   const instanceInput = options.instance;
   const app = requireNonEmptyString(instanceInput?.app, 'instance.app');
@@ -179,8 +203,7 @@ export function resolveOptions(
   }
 
   return {
-    baseUrl,
-    authorizationHeader,
+    serviceUrls,
     heartbeatIntervalMs: heartbeatIntervalSeconds * 1000,
     leaseDurationSeconds,
     registrationMode,

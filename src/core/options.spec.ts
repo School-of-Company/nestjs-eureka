@@ -24,6 +24,54 @@ describe('resolveOptions', () => {
     expect(resolved.instance.metadata).toEqual({});
     expect(resolved.registrationMode).toBe('fail-fast');
     expect(resolved.requestTimeoutMs).toBe(5_000);
+    expect(resolved.serviceUrls).toEqual([
+      {
+        baseUrl: 'http://localhost:8761/eureka',
+        authorizationHeader: undefined,
+      },
+    ]);
+  });
+
+  describe('serviceUrl (single vs. multiple servers)', () => {
+    it('accepts an array of URLs, parsing each independently', () => {
+      const options = baseOptions();
+      options.serviceUrl = [
+        'http://a:8761/eureka',
+        'http://user:pass@b:8762/eureka',
+      ];
+      const resolved = resolveOptions(options);
+      expect(resolved.serviceUrls).toHaveLength(2);
+      expect(resolved.serviceUrls[0]).toEqual({
+        baseUrl: 'http://a:8761/eureka',
+        authorizationHeader: undefined,
+      });
+      expect(resolved.serviceUrls[1]).toEqual({
+        baseUrl: 'http://b:8762/eureka',
+        authorizationHeader: `Basic ${Buffer.from('user:pass').toString('base64')}`,
+      });
+    });
+
+    it('rejects an empty array', () => {
+      const options = baseOptions();
+      options.serviceUrl = [];
+      expect(() => resolveOptions(options)).toThrow(
+        /serviceUrl.*non-empty array/,
+      );
+    });
+
+    it('rejects a non-string/empty element, naming its index', () => {
+      const options = baseOptions();
+      options.serviceUrl = ['http://a:8761/eureka', ''];
+      expect(() => resolveOptions(options)).toThrow(/serviceUrl\[1\]/);
+    });
+
+    it('rejects an invalid URL inside the array the same way a single invalid string is rejected', () => {
+      const options = baseOptions();
+      options.serviceUrl = ['http://a:8761/eureka', 'not a url'];
+      expect(() => resolveOptions(options)).toThrow(
+        /Invalid Eureka service URL/,
+      );
+    });
   });
 
   it('accepts a custom requestTimeoutMs', () => {

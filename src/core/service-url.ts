@@ -36,14 +36,15 @@ export function parseServiceUrl(serviceUrl: string): ParsedServiceUrl {
   }
   if (url.pathname.includes('@')) {
     // A comma-joined multi-URL input (e.g. Spring's `defaultZone` convention,
-    // `http://u1:p1@host-a/eureka/,http://u2:secret@host-b/eureka/`) is not
-    // supported (see README's "Not implemented yet"), but critically must be
+    // `http://u1:p1@host-a/eureka/,http://u2:secret@host-b/eureka/`) must be
     // *rejected*, not silently mis-parsed: `new URL()` only recognizes the
     // first `user:pass@host` as credentials and treats the rest as a literal
     // path, which would otherwise leak the second URL's credentials into
-    // every request path, `EurekaRequestError.url`, and log lines.
+    // every request path, `EurekaRequestError.url`, and log lines. Multiple
+    // servers ARE supported (see `options.ts`'s `serviceUrl: string[]`) —
+    // just not via this comma-joined single-string convention.
     throw new Error(
-      `${INVALID_URL_MESSAGE}: only a single Eureka server URL is supported`,
+      `${INVALID_URL_MESSAGE}: a comma-joined multi-server URL is not supported — pass an array of URLs instead`,
     );
   }
 

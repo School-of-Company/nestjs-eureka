@@ -73,7 +73,7 @@ describe('parseServiceUrl', () => {
     expect(error).toBeDefined();
     expect(error!.message).not.toContain('secret2');
     expect(error!.message).toBe(
-      'Invalid Eureka service URL: only a single Eureka server URL is supported',
+      'Invalid Eureka service URL: a comma-joined multi-server URL is not supported — pass an array of URLs instead',
     );
   });
 
