@@ -14,10 +14,22 @@ function createDeferred<T>() {
 
 function createClientMock() {
   return {
-    register: jest.fn<Promise<void>, []>(),
-    renew: jest.fn<Promise<RenewResult>, []>(),
+    register: jest.fn<Promise<void>, [AbortSignal?]>(),
+    renew: jest.fn<Promise<RenewResult>, [AbortSignal?]>(),
     deregister: jest.fn<Promise<void>, []>(),
   };
+}
+
+/** Like a real fetch that never gets a response: settles only when its signal aborts. */
+function hangUntilAborted<T>() {
+  return (signal?: AbortSignal) =>
+    new Promise<T>((_resolve, reject) => {
+      signal?.addEventListener(
+        'abort',
+        () => reject(new Error('Eureka request failed')),
+        { once: true },
+      );
+    });
 }
 type ClientMock = ReturnType<typeof createClientMock>;
 
@@ -246,10 +258,11 @@ describe('EurekaRegistration', () => {
       expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
-    it('stop() during an in-flight initial register that then fails: start() still rejects with the original error, stop() resolves cleanly with no DELETE (no deadlock)', async () => {
+    it('stop() during an in-flight initial register that then fails: start() still rejects with the original error, stop() resolves cleanly with one best-effort DELETE (outcome unknown, no deadlock)', async () => {
       const client = createClientMock();
       const registerDeferred = createDeferred<void>();
       client.register.mockReturnValue(registerDeferred.promise);
+      client.deregister.mockResolvedValue(undefined);
       const registerError = new Error('eureka unreachable');
       const registration = newRegistration(client, 1000, createLoggerMock());
 
@@ -259,7 +272,7 @@ describe('EurekaRegistration', () => {
 
       await expect(startPromise).rejects.toBe(registerError);
       await expect(stopPromise).resolves.toBeUndefined();
-      expect(client.deregister).not.toHaveBeenCalled();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
     it('stop() during a 404-triggered re-register that then succeeds waits for it, then sends exactly one DELETE', async () => {
@@ -286,9 +299,10 @@ describe('EurekaRegistration', () => {
       expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
-    it('stop() during a 404-triggered re-register that fails sends no DELETE', async () => {
+    it('stop() during a 404-triggered re-register that fails sends one best-effort DELETE (outcome unknown)', async () => {
       const client = createClientMock();
       client.register.mockResolvedValueOnce(undefined);
+      client.deregister.mockResolvedValue(undefined);
       const registration = newRegistration(client, 1000, createLoggerMock());
       await registration.start();
 
@@ -302,7 +316,7 @@ describe('EurekaRegistration', () => {
       reRegisterDeferred.reject(new Error('still unreachable'));
 
       await expect(stopPromise).resolves.toBeUndefined();
-      expect(client.deregister).not.toHaveBeenCalled();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -396,6 +410,130 @@ describe('EurekaRegistration', () => {
       await registration.start();
 
       expect(client.register).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('shutdown cancellation', () => {
+    it('stop() aborts a hanging renew instead of waiting for it, then DELETEs with no cancellation signal', async () => {
+      const client = createClientMock();
+      client.register.mockResolvedValue(undefined);
+      client.renew.mockImplementation(hangUntilAborted<RenewResult>());
+      client.deregister.mockResolvedValue(undefined);
+      const logger = createLoggerMock();
+      const registration = newRegistration(client, 1000, logger);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.renew).toHaveBeenCalledTimes(1);
+      const renewSignal = client.renew.mock.calls[0][0]!;
+      expect(renewSignal.aborted).toBe(false);
+
+      await expect(registration.stop()).resolves.toBeUndefined();
+
+      expect(renewSignal.aborted).toBe(true);
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+      expect(client.deregister).toHaveBeenCalledWith();
+      expect(jest.getTimerCount()).toBe(0);
+      // A shutdown-aborted renew is not a heartbeat failure.
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('fail-fast: stop() aborts a hanging initial register; start() rejects, stop() resolves with one best-effort DELETE', async () => {
+      const client = createClientMock();
+      client.register.mockImplementation(hangUntilAborted<void>());
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newRegistration(client, 1000, createLoggerMock());
+
+      const startPromise = registration.start();
+      const stopPromise = registration.stop();
+
+      await expect(startPromise).rejects.toThrow();
+      await expect(stopPromise).resolves.toBeUndefined();
+      expect(client.register.mock.calls[0][0]!.aborted).toBe(true);
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('background: stop() aborts a hanging initial register; both resolve, one best-effort DELETE, no failure log', async () => {
+      const client = createClientMock();
+      client.register.mockImplementation(hangUntilAborted<void>());
+      client.deregister.mockResolvedValue(undefined);
+      const logger = createLoggerMock();
+      const registration = newRegistration(client, 1000, logger, 'background');
+
+      const startPromise = registration.start();
+      const stopPromise = registration.stop();
+
+      await expect(startPromise).resolves.toBeUndefined();
+      await expect(stopPromise).resolves.toBeUndefined();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it('background, never registered: stop() aborting a hanging renew sends no DELETE', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValueOnce(new Error('eureka unreachable'));
+      client.renew.mockImplementation(hangUntilAborted<RenewResult>());
+      const logger = createLoggerMock();
+      const registration = newRegistration(client, 1000, logger, 'background');
+      await registration.start();
+      expect(logger.warn).toHaveBeenCalledTimes(1); // the initial failure only
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.renew).toHaveBeenCalledTimes(1);
+
+      await expect(registration.stop()).resolves.toBeUndefined();
+
+      expect(client.deregister).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('404 renew -> re-register in flight -> stop(): re-register is aborted, exactly one DELETE, no next heartbeat, no failure log', async () => {
+      const client = createClientMock();
+      client.register
+        .mockResolvedValueOnce(undefined)
+        .mockImplementationOnce(hangUntilAborted<void>());
+      client.renew.mockResolvedValueOnce('not-found');
+      client.deregister.mockResolvedValue(undefined);
+      const logger = createLoggerMock();
+      const registration = newRegistration(client, 1000, logger);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.register).toHaveBeenCalledTimes(2);
+      const reRegisterSignal = client.register.mock.calls[1][0]!;
+      expect(reRegisterSignal.aborted).toBe(false);
+
+      await expect(registration.stop()).resolves.toBeUndefined();
+
+      expect(reRegisterSignal.aborted).toBe(true);
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(client.renew).toHaveBeenCalledTimes(1);
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('each lifecycle call gets its own, not-yet-aborted signal', async () => {
+      const client = createClientMock();
+      client.register.mockResolvedValue(undefined);
+      client.renew.mockResolvedValue('renewed');
+      const registration = newRegistration(client, 1000, createLoggerMock());
+      await registration.start();
+      await jest.advanceTimersByTimeAsync(2000);
+
+      const signals = [
+        client.register.mock.calls[0][0],
+        client.renew.mock.calls[0][0],
+        client.renew.mock.calls[1][0],
+      ];
+      for (const signal of signals) {
+        expect(signal).toBeInstanceOf(AbortSignal);
+        expect(signal!.aborted).toBe(false);
+      }
+      expect(new Set(signals).size).toBe(3);
     });
   });
 
@@ -496,10 +634,11 @@ describe('EurekaRegistration', () => {
       expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
-    it('stop() during an in-flight initial register that then fails: both resolve, no DELETE, no heartbeat scheduled', async () => {
+    it('stop() during an in-flight initial register that then fails: both resolve, one best-effort DELETE, no heartbeat scheduled', async () => {
       const client = createClientMock();
       const registerDeferred = createDeferred<void>();
       client.register.mockReturnValue(registerDeferred.promise);
+      client.deregister.mockResolvedValue(undefined);
       const registration = newBackgroundRegistration(client);
 
       const startPromise = registration.start();
@@ -510,7 +649,7 @@ describe('EurekaRegistration', () => {
       await expect(stopPromise).resolves.toBeUndefined();
       await jest.advanceTimersByTimeAsync(10_000);
       expect(client.renew).not.toHaveBeenCalled();
-      expect(client.deregister).not.toHaveBeenCalled();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
     it('stop() during an in-flight initial register that then succeeds sends exactly one DELETE, no heartbeat scheduled', async () => {

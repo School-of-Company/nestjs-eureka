@@ -83,6 +83,50 @@ describe('Eureka registration (e2e)', () => {
     expect(deleteRequests).toHaveLength(1);
   }, 20_000);
 
+  it('shutdown cancels a hanging heartbeat instead of waiting out requestTimeoutMs, then deregisters exactly once', async () => {
+    const instanceId = 'host-1:my-app:3000';
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: stub.url,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+            instanceId,
+          },
+          heartbeatIntervalSeconds: 1,
+          leaseDurationSeconds: 3,
+          requestTimeoutMs: 10_000,
+        }),
+      ],
+    })
+    class TestModule {}
+
+    const appContext = await NestFactory.createApplicationContext(TestModule, {
+      logger: false,
+    });
+
+    stub.hangRenewals = true;
+    // Proves the PUT has actually reached the server (and is hanging there)
+    // before we shut down — otherwise this could pass by shutting down before
+    // any heartbeat was in flight.
+    await waitFor(() => stub.hangingRenewalCount === 1, 5000);
+
+    const started = performance.now();
+    await appContext.close();
+    const elapsedMs = performance.now() - started;
+
+    // Evidence that cancellation works through real undici — not a library
+    // timing contract. Without cancellation this would take ~10s.
+    expect(elapsedMs).toBeLessThan(2_000);
+    const deleteRequests = stub.requests.filter((r) => r.method === 'DELETE');
+    expect(deleteRequests).toHaveLength(1);
+    expect(stub.hangingRenewalCount).toBe(1);
+  }, 20_000);
+
   it('background mode: boots while Eureka rejects registration, registers once Eureka recovers, and deregisters exactly once', async () => {
     const instanceId = 'host-1:my-app:3000';
     stub.failRegistrations = true;
