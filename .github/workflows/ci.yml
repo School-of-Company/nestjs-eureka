@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only cancel superseded runs on the same PR — never cancel a push to
+  # master, so every commit that lands there keeps its own CI result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20.3.0', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint:check
+
+      # --json/--outputFile also feeds the PR coverage-comment step below
+      # (Node 22 leg, PRs only) — a harmless extra file on the other leg.
+      - run: pnpm test:cov --ci --json --testLocationInResults --outputFile=report.json
+
+      - run: pnpm test:e2e
+
+      - run: pnpm build
+
+      # Coverage reporting only, not gated on a threshold — a coverage
+      # percentage target tends to reward padding test counts over finding
+      # real bugs. One leg is enough; the report doesn't vary by Node version.
+      - if: matrix.node-version == '22'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+
+      - if: github.event_name == 'pull_request' && matrix.node-version == '22'
+        name: Post coverage summary as a PR comment
+        # Pinned to the v2 tag's commit (this repo has `pull-requests: write`).
+        uses: ArtiomTr/jest-coverage-report-action@7f750dd50f5585533321eb7ebc482b936b49a5d4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          skip-step: all
+          coverage-file: report.json
+          # Same file as coverage-file: opts out of the base-branch coverage
+          # diff, which otherwise checks out master and re-runs the whole
+          # suite there with npm (ignoring this repo's pnpm lockfile) just to
+          # produce a comparison this workflow doesn't need.
+          base-coverage-file: report.json
+          annotations: none

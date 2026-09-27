@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `registrationMode` option (`'fail-fast'` default, or `'background'`) — in background mode a failed initial registration no longer fails application bootstrap; it is retried on the heartbeat schedule instead.
 - `requestTimeoutMs` option (default 5000) — replaces the previous fixed, non-configurable 5-second request timeout.
 - Public types: `EurekaModuleOptions`, `EurekaModuleAsyncOptions`, `EurekaOptionsFactory`, `EurekaInstanceOptions`, `EurekaInstance`, `EurekaInstanceStatus`.
+- CI (GitHub Actions): lint, unit tests with coverage, e2e tests, and build run on every push/PR to `master`, against Node.js 20.3.0 and 22. Coverage is reported (uploaded as an artifact, and posted as a PR comment) but not gated on a threshold.
 
 ### Changed
 

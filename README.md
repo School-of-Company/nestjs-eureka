@@ -1,5 +1,7 @@
 # nestjs-eureka
 
+[![CI](https://github.com/School-of-Company/nestjs-eureka/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/School-of-Company/nestjs-eureka/actions/workflows/ci.yml)
+
 A NestJS integration for Netflix Eureka service registration and discovery.
 
 > **Status: pre-release.** The public API may still change before a 1.0 release. Verified both against an in-repo HTTP stub server and manually against a real Spring Cloud Netflix Eureka Server — see [Compatibility](#compatibility).
