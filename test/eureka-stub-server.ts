@@ -20,6 +20,8 @@ export class EurekaStubServer {
   private readonly server: Server;
   private readonly registry = new Map<string, Record<string, unknown>>();
   readonly requests: RecordedRequest[] = [];
+  /** When true, registration (POST) requests get a 503 and nothing is stored. */
+  failRegistrations = false;
   private port = 0;
 
   constructor() {
@@ -80,6 +82,10 @@ export class EurekaStubServer {
     const instanceId = match[2] ? decodeURIComponent(match[2]) : undefined;
 
     if (method === 'POST' && !instanceId) {
+      if (this.failRegistrations) {
+        res.writeHead(503).end();
+        return;
+      }
       const instance = (body as { instance?: Record<string, unknown> })
         ?.instance;
       if (instance && typeof instance.instanceId === 'string') {

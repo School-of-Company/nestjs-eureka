@@ -29,11 +29,13 @@ function newRegistration(
   client: ClientMock,
   heartbeatIntervalMs: number,
   logger: EurekaLogger,
+  registrationMode: 'fail-fast' | 'background' = 'fail-fast',
 ) {
   return new EurekaRegistration(
     client as unknown as EurekaClient,
     heartbeatIntervalMs,
     logger,
+    registrationMode,
   );
 }
 
@@ -393,6 +395,192 @@ describe('EurekaRegistration', () => {
 
       await registration.start();
 
+      expect(client.register).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('background registration mode', () => {
+    function newBackgroundRegistration(
+      client: ClientMock,
+      logger: EurekaLogger = createLoggerMock(),
+    ) {
+      return newRegistration(client, 1000, logger, 'background');
+    }
+
+    it('resolves start() and logs a warning when the initial register fails', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValue(new Error('eureka unreachable'));
+      const logger = createLoggerMock();
+      const registration = newBackgroundRegistration(client, logger);
+
+      await expect(registration.start()).resolves.toBeUndefined();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('eureka unreachable'),
+      );
+      // Running, not terminal: a second start() is a no-op, not a rejection.
+      await expect(registration.start()).resolves.toBeUndefined();
+      expect(client.register).toHaveBeenCalledTimes(1);
+    });
+
+    it('case A: initial register throws, then renew succeeds -> no second POST, stop() sends DELETE', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValueOnce(new Error('timed out'));
+      client.renew.mockResolvedValue('renewed');
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.renew).toHaveBeenCalledTimes(1);
+
+      await registration.stop();
+
+      expect(client.register).toHaveBeenCalledTimes(1);
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+    });
+
+    it('case B: initial register throws, then renew returns 404 -> exactly one re-register POST, stop() sends DELETE', async () => {
+      const client = createClientMock();
+      client.register
+        .mockRejectedValueOnce(new Error('eureka unreachable'))
+        .mockResolvedValueOnce(undefined);
+      client.renew
+        .mockResolvedValue('renewed')
+        .mockResolvedValueOnce('not-found');
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.register).toHaveBeenCalledTimes(2);
+
+      await registration.stop();
+
+      expect(client.register).toHaveBeenCalledTimes(2);
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps retrying on the heartbeat cadence with a single timer while Eureka stays down, and sends no DELETE', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValue(new Error('eureka unreachable'));
+      client.renew.mockRejectedValue(new Error('eureka unreachable'));
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+      expect(jest.getTimerCount()).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(3000);
+
+      expect(client.renew).toHaveBeenCalledTimes(3);
+      expect(jest.getTimerCount()).toBe(1);
+
+      await registration.stop();
+      expect(client.deregister).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('a renew that throws (network/timeout/5xx) does not clear registered — stop() still sends DELETE', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValueOnce(new Error('timed out'));
+      client.renew
+        .mockResolvedValueOnce('renewed')
+        .mockRejectedValueOnce(new Error('503'));
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(client.renew).toHaveBeenCalledTimes(2);
+
+      await registration.stop();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+    });
+
+    it('stop() during an in-flight initial register that then fails: both resolve, no DELETE, no heartbeat scheduled', async () => {
+      const client = createClientMock();
+      const registerDeferred = createDeferred<void>();
+      client.register.mockReturnValue(registerDeferred.promise);
+      const registration = newBackgroundRegistration(client);
+
+      const startPromise = registration.start();
+      const stopPromise = registration.stop();
+      registerDeferred.reject(new Error('eureka unreachable'));
+
+      await expect(startPromise).resolves.toBeUndefined();
+      await expect(stopPromise).resolves.toBeUndefined();
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(client.renew).not.toHaveBeenCalled();
+      expect(client.deregister).not.toHaveBeenCalled();
+    });
+
+    it('stop() during an in-flight initial register that then succeeds sends exactly one DELETE, no heartbeat scheduled', async () => {
+      const client = createClientMock();
+      const registerDeferred = createDeferred<void>();
+      client.register.mockReturnValue(registerDeferred.promise);
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+
+      const startPromise = registration.start();
+      const stopPromise = registration.stop();
+      registerDeferred.resolve();
+      await startPromise;
+      await stopPromise;
+
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(client.renew).not.toHaveBeenCalled();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+    });
+
+    it('stop() during an in-flight renew that then succeeds still sends the owed DELETE (initial POST had silently succeeded)', async () => {
+      const client = createClientMock();
+      client.register.mockRejectedValueOnce(new Error('timed out'));
+      const renewDeferred = createDeferred<RenewResult>();
+      client.renew.mockReturnValueOnce(renewDeferred.promise);
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(client.renew).toHaveBeenCalledTimes(1);
+
+      const stopPromise = registration.stop();
+      renewDeferred.resolve('renewed');
+      await stopPromise;
+
+      expect(client.deregister).toHaveBeenCalledTimes(1);
+    });
+
+    it('stop() during an in-flight renew that then returns 404 sends no DELETE and no re-register', async () => {
+      const client = createClientMock();
+      client.register.mockResolvedValueOnce(undefined);
+      const renewDeferred = createDeferred<RenewResult>();
+      client.renew.mockReturnValueOnce(renewDeferred.promise);
+      client.deregister.mockResolvedValue(undefined);
+      const registration = newBackgroundRegistration(client);
+      await registration.start();
+
+      await jest.advanceTimersByTimeAsync(1000);
+      const stopPromise = registration.stop();
+      renewDeferred.resolve('not-found');
+      await stopPromise;
+
+      expect(client.register).toHaveBeenCalledTimes(1);
+      expect(client.deregister).not.toHaveBeenCalled();
+    });
+
+    it('concurrent start() calls share a single register() call and both resolve even when it fails', async () => {
+      const client = createClientMock();
+      const registerDeferred = createDeferred<void>();
+      client.register.mockReturnValue(registerDeferred.promise);
+      const registration = newBackgroundRegistration(client);
+
+      const [a, b] = [registration.start(), registration.start()];
+      registerDeferred.reject(new Error('eureka unreachable'));
+
+      await expect(Promise.all([a, b])).resolves.toEqual([
+        undefined,
+        undefined,
+      ]);
       expect(client.register).toHaveBeenCalledTimes(1);
     });
   });

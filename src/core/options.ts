@@ -31,6 +31,12 @@ export interface EurekaClientOptions {
   heartbeatIntervalSeconds?: number;
   /** Default 90. */
   leaseDurationSeconds?: number;
+  /**
+   * Default `'fail-fast'`: a failed initial registration rejects application
+   * bootstrap. `'background'`: the failure is logged, bootstrap continues,
+   * and registration is retried on the heartbeat schedule until it succeeds.
+   */
+  registrationMode?: 'fail-fast' | 'background';
 }
 
 /**
@@ -43,6 +49,7 @@ export interface ResolvedEurekaOptions {
   authorizationHeader?: string;
   heartbeatIntervalMs: number;
   leaseDurationSeconds: number;
+  registrationMode: 'fail-fast' | 'background';
   instance: {
     /** The Eureka application name, uppercased — used for the path and the body's `app` field. */
     eurekaAppName: string;
@@ -161,11 +168,19 @@ export function resolveOptions(
     );
   }
 
+  const registrationMode = options.registrationMode ?? 'fail-fast';
+  if (registrationMode !== 'fail-fast' && registrationMode !== 'background') {
+    throw new Error(
+      'Eureka configuration: "registrationMode" must be "fail-fast" or "background"',
+    );
+  }
+
   return {
     baseUrl,
     authorizationHeader,
     heartbeatIntervalMs: heartbeatIntervalSeconds * 1000,
     leaseDurationSeconds,
+    registrationMode,
     instance: {
       eurekaAppName: app.toUpperCase(),
       instanceId,

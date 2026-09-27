@@ -80,6 +80,26 @@ describe('EurekaService (Nest lifecycle wiring)', () => {
     await expect(moduleRef.init()).rejects.toBeDefined();
   });
 
+  it('boots anyway in background registration mode when the initial registration fails', async () => {
+    fetchMock.mockResolvedValue(mockResponse(false, 500));
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [
+        EurekaModule.forRoot({
+          ...validOptions(),
+          registrationMode: 'background',
+        }),
+      ],
+    }).compile();
+
+    await expect(moduleRef.init()).resolves.toBeDefined();
+
+    await moduleRef.close();
+    const deleteCalls = fetchMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit).method === 'DELETE',
+    );
+    expect(deleteCalls).toHaveLength(0);
+  });
+
   it('getInstances() delegates to the underlying client', async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(true, 204)); // register on init
     const moduleRef: TestingModule = await Test.createTestingModule({
