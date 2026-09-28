@@ -63,21 +63,64 @@ export class EurekaClient {
     });
   }
 
+  /**
+   * Attempts a deregistration against *every* configured server, unlike
+   * register()/renew()/getInstances() (which stop at the first server that
+   * completes the operation). A 200/404 on one server says nothing about
+   * whether another, independent server still holds this registration —
+   * `preferredIndex` is only a best-effort hint for where to look first for
+   * those other three operations, not a record of which server(s) this
+   * instance is actually registered on. So this method deliberately does not
+   * use `withFailover()` (and does not read or update `preferredIndex`) —
+   * every server gets exactly one sequential `DELETE`, always.
+   *
+   * Contract: 2xx and 404 are both a successful cleanup outcome for that
+   * server. Any transport failure or other non-2xx/non-404 response makes
+   * the overall call reject — even if every other configured server
+   * succeeded — because that server's cleanup outcome is unknown, and a
+   * success elsewhere doesn't erase that. If more than one server fails,
+   * the last failure encountered is what's thrown; this method never
+   * aggregates multiple errors into a new error type.
+   *
+   * This attempts deregistration against every server — it can't guarantee
+   * the instance is actually gone everywhere (a server may simply be
+   * unreachable for the whole attempt).
+   *
+   * Sequential, not parallel: with N configured servers, worst-case latency
+   * is N * `requestTimeoutMs`. Deliberate — parallelizing this is a separate
+   * concurrency/error-aggregation decision, out of scope here.
+   */
   async deregister(): Promise<void> {
-    await this.withFailover(undefined, async (server) => {
+    let cleanupFailure: EurekaRequestError | undefined;
+    for (const server of this.resolved.serviceUrls) {
       const url = this.instanceUrl(server);
-      const response = await this.rawFetch(
-        'deregister',
-        'DELETE',
-        url,
-        undefined,
-        undefined,
-        server.authorizationHeader,
-      );
-      await this.drain(response);
-      if (response.ok || response.status === 404) return;
-      throw this.statusError('deregister', 'DELETE', url, response);
-    });
+      try {
+        const response = await this.rawFetch(
+          'deregister',
+          'DELETE',
+          url,
+          undefined,
+          undefined,
+          server.authorizationHeader,
+        );
+        await this.drain(response);
+        if (!response.ok && response.status !== 404) {
+          cleanupFailure = this.statusError(
+            'deregister',
+            'DELETE',
+            url,
+            response,
+          );
+        }
+      } catch (error) {
+        // An unexpected/programming error, not an operational deregister
+        // failure — propagate immediately rather than lumping it in with a
+        // normal per-server cleanup failure (same principle as `withFailover`).
+        if (!(error instanceof EurekaRequestError)) throw error;
+        cleanupFailure = error;
+      }
+    }
+    if (cleanupFailure) throw cleanupFailure;
   }
 
   async getInstances(appName: string): Promise<EurekaInstance[]> {
@@ -134,9 +177,11 @@ export class EurekaClient {
 
   /**
    * Tries `attempt` against each configured server, starting from
-   * `preferredIndex` and rotating through the rest. A server becomes
-   * preferred whenever `attempt` *returns* — a definitive protocol answer
-   * that ends the loop (a 2xx, or a meaningful 404 for renew/deregister/
+   * `preferredIndex` and rotating through the rest. Used by register()/
+   * renew()/getInstances() only — deregister() has a different contract
+   * (attempt every server, never stop early) and doesn't use this. A server
+   * becomes preferred whenever `attempt` *returns* — a definitive protocol
+   * answer that ends the loop (a 2xx, or a meaningful 404 for renew/
    * discovery). A *thrown* error never updates it, including a terminal 4xx:
    * an error isn't evidence a server is good.
    *

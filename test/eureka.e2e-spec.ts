@@ -251,4 +251,76 @@ describe('Eureka registration (e2e)', () => {
       1,
     );
   }, 20_000);
+
+  it('shutdown deregisters from a server whose registration was left behind after an unrelated discovery call moved the preferred server (#17)', async () => {
+    const instanceId = 'host-1:my-app:3000';
+    const serverA = new EurekaStubServer();
+    const serverB = new EurekaStubServer();
+    await serverA.listen();
+    await serverB.listen();
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: [serverA.url, serverB.url],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+            instanceId,
+          },
+          // Long enough that no heartbeat can fire in the short window
+          // between the discovery call below and app.close() — this test
+          // is entirely about a discovery call, not a heartbeat tick.
+          heartbeatIntervalSeconds: 30,
+          leaseDurationSeconds: 90,
+        }),
+      ],
+    })
+    class TestModule {}
+
+    const appContext = await NestFactory.createApplicationContext(TestModule, {
+      logger: false,
+    });
+
+    try {
+      // The registration lives only on A. A stays up the whole test — this
+      // is deliberately not a server-outage scenario (that's the failover
+      // test above); it's a read-only discovery call, which used to be
+      // enough (before this fix) to break shutdown cleanup on its own.
+      await waitFor(() => serverA.requests.some((r) => r.method === 'POST'));
+
+      // Force a discovery-only failover to B: A's discovery endpoint
+      // (not registration/renewal/deregistration) briefly errors, so
+      // getInstances() falls over to B. B never had this instance
+      // registered, and B's own GET is asserted below to confirm it was
+      // actually reached (not just that A's discovery failed).
+      serverA.failDiscovery = true;
+      const service = appContext.get(EurekaService);
+      await service.getInstances('my-app');
+      serverA.failDiscovery = false;
+
+      // Old, `withFailover()`-routed deregister() started from
+      // `preferredIndex` — which this discovery call could move to B — and
+      // stopped at B's response (this stub's DELETE always answers 200,
+      // whether or not the instance was ever registered there), never
+      // reaching A. The current deregister() doesn't consult
+      // `preferredIndex` at all: it always attempts every configured
+      // server, so it reaches A (where the registration actually lives)
+      // regardless of what discovery did.
+    } finally {
+      await appContext.close();
+      await serverA.close();
+      await serverB.close();
+    }
+
+    expect(serverB.requests.filter((r) => r.method === 'GET')).toHaveLength(1); // confirms B was actually reached for discovery, not just A failing
+    expect(serverA.requests.filter((r) => r.method === 'DELETE')).toHaveLength(
+      1,
+    );
+    expect(serverB.requests.filter((r) => r.method === 'DELETE')).toHaveLength(
+      1,
+    );
+  }, 20_000);
 });

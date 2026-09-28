@@ -561,18 +561,6 @@ describe('EurekaClient', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
-    it('deregister() fails over on a network error, with no caller signal involved', async () => {
-      const client = twoServerClient();
-      fetchMock
-        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
-        .mockImplementationOnce(() =>
-          Promise.resolve(mockResponse({ ok: true, status: 200 })),
-        );
-
-      await expect(client.deregister()).resolves.toBeUndefined();
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
     it('getInstances() fails over on a 5xx response', async () => {
       const client = twoServerClient();
       fetchMock
@@ -617,6 +605,187 @@ describe('EurekaClient', () => {
       );
 
       await expect(client.renew()).resolves.toBe('renewed');
+
+      const [firstCall, secondCall] = fetchMock.mock.calls as [
+        string,
+        RequestInit,
+      ][];
+      const authA = (firstCall[1].headers as Record<string, string>)
+        .Authorization;
+      const authB = (secondCall[1].headers as Record<string, string>)
+        .Authorization;
+      expect(authA).toBe(
+        `Basic ${Buffer.from('alice:a-secret').toString('base64')}`,
+      );
+      expect(authB).toBe(
+        `Basic ${Buffer.from('bob:b-secret').toString('base64')}`,
+      );
+      expect(firstCall[0]).not.toContain('alice');
+      expect(firstCall[0]).not.toContain('a-secret');
+      expect(secondCall[0]).not.toContain('bob');
+      expect(secondCall[0]).not.toContain('b-secret');
+    });
+  });
+
+  describe('deregister() attempts every configured server', () => {
+    function twoServerClient(
+      urls: [string, string] = ['http://a:8761/eureka', 'http://b:8762/eureka'],
+    ): EurekaClient {
+      return new EurekaClient(
+        resolveOptions({
+          serviceUrl: urls,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+    }
+
+    it('attempts every server even though the first already returned 404 (the original bug: withFailover-style "stop at first" would end here)', async () => {
+      const client = twoServerClient();
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: false, status: 404 })
+            : mockResponse({ ok: true, status: 200 }),
+        ),
+      );
+
+      await expect(client.deregister()).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('the core regression: the registration is on A, B (unrelated) became preferred via an earlier discovery/renew failover — deregister() must still reach A, not just the preferred B', async () => {
+      const client = twoServerClient();
+
+      // First, an unrelated renew() call fails over from A to B (A times
+      // out, B answers 200), making B `preferredIndex` — exactly the "a
+      // concurrent getInstances()/renew() call moved the preference" setup
+      // from the issue. This does NOT mean B holds the registration; it
+      // never has.
+      fetchMock
+        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
+        .mockImplementationOnce(() =>
+          Promise.resolve(mockResponse({ ok: true, status: 200 })),
+        );
+      await expect(client.renew()).resolves.toBe('renewed');
+
+      // Now shut down. The registration actually lives on A (200); B, the
+      // now-preferred server, correctly answers 404 (it never had it). The
+      // old `withFailover`-routed deregister() would start at preferred B,
+      // see 404, and stop — leaving A registered forever.
+      fetchMock.mockClear();
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({ ok: true, status: 200 })
+            : mockResponse({ ok: false, status: 404 }),
+        ),
+      );
+
+      await expect(client.deregister()).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(2); // both A and B were contacted
+    });
+
+    it('the duplicate-registration scenario: both servers may genuinely hold the instance, so both get a DELETE even when the first already succeeded', async () => {
+      const client = twoServerClient();
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+
+      await expect(client.deregister()).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(2); // not stopped after A's success
+    });
+
+    it('rejects if any server has a genuine failure, even when every other server succeeded — a success elsewhere does not erase it', async () => {
+      const client = twoServerClient();
+      fetchMock
+        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
+        .mockImplementationOnce(() =>
+          Promise.resolve(mockResponse({ ok: true, status: 200 })),
+        );
+
+      const error = await client.deregister().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // B was still attempted despite A's failure
+    });
+
+    it('rejects with the last failure when every server fails, having attempted each exactly once', async () => {
+      const client = twoServerClient();
+      fetchMock
+        .mockImplementationOnce(() => Promise.reject(new Error('a down')))
+        .mockImplementationOnce(() => Promise.reject(new Error('b down')));
+
+      const error = await client.deregister().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect(((error as EurekaRequestError).cause as Error).message).toBe(
+        'b down',
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('never composes a caller signal and never touches preferredIndex (a subsequent renew() still starts at the default server)', async () => {
+      const client = twoServerClient();
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+
+      await client.deregister();
+
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+      await client.renew();
+      // deregister() must not have moved preferredIndex to B — the next
+      // renew() still goes to A first.
+      const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toContain('a:8761');
+    });
+
+    it('drains the response body for every server contacted, not just the last', async () => {
+      const cancelA = jest.fn().mockResolvedValue(undefined);
+      const cancelB = jest.fn().mockResolvedValue(undefined);
+      const client = twoServerClient();
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({
+                ok: false,
+                status: 404,
+                body: { cancel: cancelA },
+              })
+            : mockResponse({
+                ok: true,
+                status: 200,
+                body: { cancel: cancelB },
+              }),
+        ),
+      );
+
+      await client.deregister();
+
+      expect(cancelA).toHaveBeenCalledTimes(1);
+      expect(cancelB).toHaveBeenCalledTimes(1);
+    });
+
+    it("builds each attempt's URL and Authorization header from the same server entry — never mixes credentials", async () => {
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: [
+            'http://alice:a-secret@a:8761/eureka',
+            'http://bob:b-secret@b:8762/eureka',
+          ],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+
+      await client.deregister();
 
       const [firstCall, secondCall] = fetchMock.mock.calls as [
         string,
