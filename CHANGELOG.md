@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `heartbeatIntervalSeconds`, `leaseDurationSeconds`, and `requestTimeoutMs` accepted any positive integer, with no upper bound. A value large enough to overflow Node's 32-bit signed timer-delay limit (2,147,483,647ms) didn't fail loudly: `setTimeout` silently clamps such a delay to ~1ms — turning a long heartbeat interval into a hot loop that renews roughly every millisecond instead of the intended interval — and `AbortSignal.timeout` throws a `RangeError` from inside a request, wrapped as a generic, misleading transport failure. These three options are now rejected at configuration time if they (or, for `heartbeatIntervalSeconds`, their millisecond conversion) would exceed that limit.
+
 ## [0.1.0] - 2026-09-28
 
 First published release.
