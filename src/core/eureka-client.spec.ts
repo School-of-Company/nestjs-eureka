@@ -961,4 +961,165 @@ describe('EurekaClient', () => {
       expect(secondCall[0]).not.toContain('b-secret');
     });
   });
+
+  describe('register() reports ambiguous attempts (#16)', () => {
+    function clientFor(urls: string[]): EurekaClient {
+      return new EurekaClient(
+        resolveOptions({
+          serviceUrl: urls,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+    }
+
+    const A = 'http://a:8761/eureka';
+    const B = 'http://b:8762/eureka';
+    const C = 'http://c:8763/eureka';
+
+    it('reports a transport failure/timeout (no status) and rejects with the original error', async () => {
+      fetchMock.mockRejectedValue(new Error('ECONNRESET'));
+      const onAmbiguous = jest.fn();
+
+      const error = await clientFor([A])
+        .register(undefined, onAmbiguous)
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBeUndefined();
+      expect(onAmbiguous).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([500, 502, 503, 504])(
+      'reports a %i response (the upstream may have applied the POST)',
+      async (status) => {
+        fetchMock.mockResolvedValue(mockResponse({ ok: false, status }));
+        const onAmbiguous = jest.fn();
+
+        await expect(
+          clientFor([A]).register(undefined, onAmbiguous),
+        ).rejects.toMatchObject({ status });
+        expect(onAmbiguous).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([400, 401, 403, 404])(
+      'does not report a definitive %i rejection',
+      async (status) => {
+        fetchMock.mockResolvedValue(mockResponse({ ok: false, status }));
+        const onAmbiguous = jest.fn();
+
+        await expect(
+          clientFor([A]).register(undefined, onAmbiguous),
+        ).rejects.toMatchObject({ status });
+        expect(onAmbiguous).not.toHaveBeenCalled();
+      },
+    );
+
+    it('does not report a redirect (3xx)', async () => {
+      fetchMock.mockResolvedValue(mockRedirectResponse(301));
+      const onAmbiguous = jest.fn();
+
+      await expect(
+        clientFor([A]).register(undefined, onAmbiguous),
+      ).rejects.toMatchObject({ status: 301 });
+      expect(onAmbiguous).not.toHaveBeenCalled();
+    });
+
+    it('does not report a success', async () => {
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 204 }));
+      const onAmbiguous = jest.fn();
+
+      await clientFor([A]).register(undefined, onAmbiguous);
+
+      expect(onAmbiguous).not.toHaveBeenCalled();
+    });
+
+    it('reports a caller abort (no status) — shutdown owns that cleanup, so reporting it is harmless', async () => {
+      const controller = new AbortController();
+      controller.abort();
+      fetchMock.mockImplementation((_url: string, init: RequestInit) =>
+        Promise.reject(init.signal!.reason as Error),
+      );
+      const onAmbiguous = jest.fn();
+
+      await expect(
+        clientFor([A, B]).register(controller.signal, onAmbiguous),
+      ).rejects.toBeInstanceOf(EurekaRequestError);
+      expect(fetchMock).toHaveBeenCalledTimes(1); // no failover after an abort
+      expect(onAmbiguous).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not report an unexpected (non-EurekaRequestError) error', async () => {
+      const unexpected = new TypeError('broken response object');
+      fetchMock.mockResolvedValue({
+        status: 200,
+        get ok(): boolean {
+          throw unexpected;
+        },
+      });
+      const onAmbiguous = jest.fn();
+
+      await expect(
+        clientFor([A]).register(undefined, onAmbiguous),
+      ).rejects.toBe(unexpected);
+      expect(onAmbiguous).not.toHaveBeenCalled();
+    });
+
+    it('A times out, then B answers 400: rejects with B’s own error, but still reports A', async () => {
+      const bError = mockResponse({ ok: false, status: 400 });
+      fetchMock.mockImplementation((url: string) =>
+        url.startsWith(A)
+          ? Promise.reject(new Error('timed out'))
+          : Promise.resolve(bError),
+      );
+      const onAmbiguous = jest.fn();
+
+      const error = await clientFor([A, B])
+        .register(undefined, onAmbiguous)
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBe(400);
+      expect((error as EurekaRequestError).url).toContain('b:8762');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(onAmbiguous).toHaveBeenCalledTimes(1);
+    });
+
+    it('A answers 503, then B succeeds: resolves, but still reports A', async () => {
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.startsWith(A)
+            ? mockResponse({ ok: false, status: 503 })
+            : mockResponse({ ok: true, status: 204 }),
+        ),
+      );
+      const onAmbiguous = jest.fn();
+
+      await expect(
+        clientFor([A, B]).register(undefined, onAmbiguous),
+      ).resolves.toBeUndefined();
+      expect(onAmbiguous).toHaveBeenCalledTimes(1);
+    });
+
+    it('A times out, B answers 503, C answers 400: reports once per ambiguous attempt, rejects with C’s error', async () => {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.startsWith(A)) return Promise.reject(new Error('timed out'));
+        if (url.startsWith(B))
+          return Promise.resolve(mockResponse({ ok: false, status: 503 }));
+        return Promise.resolve(mockResponse({ ok: false, status: 400 }));
+      });
+      const onAmbiguous = jest.fn();
+
+      await expect(
+        clientFor([A, B, C]).register(undefined, onAmbiguous),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(onAmbiguous).toHaveBeenCalledTimes(2);
+    });
+  });
 });

@@ -23,6 +23,13 @@ interface ActiveOperation {
 export class EurekaRegistration {
   private state: State = 'idle';
   private registered = false;
+  /** Some register attempt may have created remote state (a timeout,
+   *  transport failure, abort, or 5xx on some server) that no deregistration
+   *  has been attempted for yet. Sticky: a renew 200/404 or a later
+   *  successful register is an answer from one server, not proof that every
+   *  server is clean — only `deregisterBestEffort()` clears it. Where the
+   *  DELETE goes is `EurekaClient.deregister()`'s job (every server). */
+  private registrationCleanupOwed = false;
   /** Whatever single Eureka HTTP call is currently in flight (the initial
    *  register, or the current heartbeat tick's renew/re-register). Assigned
    *  synchronously, before any `await` inside it runs. */
@@ -44,7 +51,8 @@ export class EurekaRegistration {
    * Registers with Eureka and starts the heartbeat loop. In fail-fast mode,
    * rejects with the original registration error on failure — the caller
    * (Nest's `onApplicationBootstrap`) is expected to let that fail
-   * application boot. In background mode, a failed registration is logged
+   * application boot. If any attempt's outcome was unknown, a best-effort
+   * deregistration is awaited before that rejection. In background mode, a failed registration is logged
    * and retried by the heartbeat loop, and this resolves anyway.
    */
   start(): Promise<void> {
@@ -61,9 +69,7 @@ export class EurekaRegistration {
     this.state = 'starting';
     const operation = (async () => {
       try {
-        await this.runOperation('register', (signal) =>
-          this.client.register(signal),
-        );
+        await this.register();
         this.registered = true;
         // stop() may have already claimed ownership of stopping->stopped
         // while this register call was in flight — if so, leave the state
@@ -75,8 +81,21 @@ export class EurekaRegistration {
       } catch (error) {
         if (this.registrationMode === 'fail-fast') {
           // Only claim the `stopped` transition if it's still ours to claim —
-          // stop() is the only path allowed to move `stopping -> stopped`.
-          if (this.state === 'starting') this.state = 'stopped';
+          // stop() is the only path allowed to move `stopping -> stopped`,
+          // and then it also owns the cleanup (no second DELETE from here).
+          if (this.state === 'starting') {
+            this.state = 'stopped';
+            // A failed bootstrap means Nest never runs shutdown hooks, so
+            // stop() may never be called: clean up here. Awaited, because
+            // the process typically exits right after the rejection.
+            if (this.registrationCleanupOwed) {
+              // `.catch`: a throwing injected logger must never replace the
+              // original registration error below.
+              await this.deregisterBestEffort(
+                'after a failed initial registration',
+              ).catch(() => undefined);
+            }
+          }
           throw error; // the original start() caller always sees this
         }
         // Background mode: never reject. If stop() already landed (and
@@ -114,6 +133,9 @@ export class EurekaRegistration {
     // after stop() will ever renew and reconcile that, so we DELETE
     // conservatively (a DELETE of an unknown instance is a 404, which
     // deregister() treats as success). Don't reduce this to `if (registered)`.
+    // Usually `registrationCleanupOwed` is also set by then (an abort is a
+    // status-less attempt); this stays as the backstop for a client/fetch
+    // that doesn't surface the abort that way.
     const interruptedRegister = this.activeOperation?.kind === 'register';
     this.activeOperation?.controller.abort();
     if (this.pendingOperation) {
@@ -124,22 +146,45 @@ export class EurekaRegistration {
     // `registered` must only be inspected *after* awaiting whatever was in
     // flight, never before — otherwise a register that's about to succeed
     // could be missed and left dangling on the server.
-    if (this.registered || interruptedRegister) {
-      try {
-        // Deliberately no cancellation signal: the active one is already
-        // aborted. With one configured server this is one request, bounded
-        // by requestTimeoutMs; with several, deregister() attempts every
-        // one of them sequentially (see #17), up to
-        // serviceUrls.length * requestTimeoutMs in the worst case.
-        await this.client.deregister();
-      } catch (error) {
-        this.logger.warn(
-          `Eureka deregister failed during shutdown: ${(error as Error).message}`,
-        );
-      }
-      this.registered = false;
+    if (
+      this.registered ||
+      this.registrationCleanupOwed ||
+      interruptedRegister
+    ) {
+      await this.deregisterBestEffort('during shutdown');
     }
     this.state = 'stopped';
+  }
+
+  /** Runs at most once per instance across both call sites (fail-fast
+   *  start() failure, doStop()) — see their ownership guards. Only throws if
+   *  the injected logger's `warn` does. */
+  private async deregisterBestEffort(context: string): Promise<void> {
+    try {
+      // Deliberately no cancellation signal: nothing is left to cancel it
+      // for. With one configured server this is one request, bounded by
+      // requestTimeoutMs; with several, deregister() attempts every one of
+      // them sequentially (see #17), up to serviceUrls.length *
+      // requestTimeoutMs in the worst case.
+      await this.client.deregister();
+    } catch (error) {
+      this.logger.warn(
+        `Eureka deregister failed ${context}: ${(error as Error).message}`,
+      );
+    } finally {
+      // The attempt was made; retrying it later can't improve anything.
+      this.registered = false;
+      this.registrationCleanupOwed = false;
+    }
+  }
+
+  /** Every register call goes through here so an ambiguous attempt is never missed. */
+  private register(): Promise<void> {
+    return this.runOperation('register', (signal) =>
+      this.client.register(signal, () => {
+        this.registrationCleanupOwed = true;
+      }),
+    );
   }
 
   private scheduleHeartbeat(): void {
@@ -183,8 +228,10 @@ export class EurekaRegistration {
       // settles. 'renewed' proves the server has our lease even if an earlier
       // register (the initial one in background mode, or a previous tick's
       // re-register below) failed client-side after succeeding server-side;
-      // 'not-found' proves it doesn't. Either way stop() then sends a DELETE
-      // exactly when one is owed.
+      // 'not-found' proves the server that answered doesn't. Deliberately
+      // leaves `registrationCleanupOwed` alone: with several independent
+      // servers, one server's answer can't clear an ambiguous register on
+      // another.
       this.registered = result === 'renewed';
       if (this.state !== 'running') return; // stop() may have landed during the renew call
       if (result === 'not-found') {
@@ -192,9 +239,7 @@ export class EurekaRegistration {
           'Eureka heartbeat returned 404 (instance not found); re-registering',
         );
         try {
-          await this.runOperation('register', (signal) =>
-            this.client.register(signal),
-          );
+          await this.register();
           this.registered = true;
         } catch (error) {
           // Background retry path, not the fail-fast startup path: log and
