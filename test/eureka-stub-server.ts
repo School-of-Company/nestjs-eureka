@@ -38,6 +38,14 @@ export class EurekaStubServer {
    *  redirects, e.g. an http-to-https rewrite. Takes precedence over
    *  `failRegistrations` if both are set (no test currently combines them). */
   redirectRegistrationsTo?: string;
+  /** When true, a registration (POST) is stored, then never answered — the
+   *  "Eureka applied it, but the response was lost" case (#16). Ignored if
+   *  `redirectRegistrationsTo`/`failRegistrations`/`rejectRegistrations` is
+   *  set (nothing is stored then). */
+  hangRegistrationsAfterStoring = false;
+  /** When true, registration (POST) requests get a 400 and nothing is
+   *  stored. Ignored if `redirectRegistrationsTo`/`failRegistrations` is set. */
+  rejectRegistrations = false;
   private port = 0;
   private closed = false;
 
@@ -80,6 +88,10 @@ export class EurekaStubServer {
     this.registry.delete(instanceId);
   }
 
+  has(instanceId: string): boolean {
+    return this.registry.has(instanceId);
+  }
+
   private async handle(
     req: IncomingMessage,
     res: ServerResponse,
@@ -115,11 +127,16 @@ export class EurekaStubServer {
         res.writeHead(503).end();
         return;
       }
+      if (this.rejectRegistrations) {
+        res.writeHead(400).end();
+        return;
+      }
       const instance = (body as { instance?: Record<string, unknown> })
         ?.instance;
       if (instance && typeof instance.instanceId === 'string') {
         this.registry.set(instance.instanceId, instance);
       }
+      if (this.hangRegistrationsAfterStoring) return; // deliberately never respond
       res.writeHead(204).end();
       return;
     }

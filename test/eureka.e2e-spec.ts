@@ -355,4 +355,124 @@ describe('Eureka registration (e2e)', () => {
     // The redirect was never followed — no GET ever reached the server.
     expect(stub.requests.filter((r) => r.method === 'GET')).toHaveLength(0);
   }, 20_000);
+
+  describe('a registration whose outcome is unknown is always cleaned up (#16)', () => {
+    const instanceId = 'host-1:my-app:3000';
+
+    function testModule(
+      serviceUrl: string | string[],
+      registrationMode: 'fail-fast' | 'background' = 'fail-fast',
+    ) {
+      @Module({
+        imports: [
+          EurekaModule.forRoot({
+            serviceUrl,
+            instance: {
+              app: 'my-app',
+              hostName: 'host-1',
+              ipAddr: '127.0.0.1',
+              port: 3000,
+              instanceId,
+            },
+            registrationMode,
+            // No heartbeat may fire during the test — cleanup must not
+            // depend on a renew ever reconciling anything.
+            heartbeatIntervalSeconds: 30,
+            leaseDurationSeconds: 90,
+            requestTimeoutMs: 500,
+          }),
+        ],
+      })
+      class TestModule {}
+      return TestModule;
+    }
+
+    function deletes(server: EurekaStubServer): number {
+      return server.requests.filter((r) => r.method === 'DELETE').length;
+    }
+
+    it('fail-fast: a registration that Eureka stored but never answered fails bootstrap, and is deregistered first', async () => {
+      stub.hangRegistrationsAfterStoring = true;
+
+      await expect(
+        NestFactory.createApplicationContext(testModule(stub.url), {
+          logger: false,
+        }),
+      ).rejects.toThrow(/register request failed/);
+
+      expect(deletes(stub)).toBe(1);
+      expect(stub.has(instanceId)).toBe(false);
+    }, 20_000);
+
+    it('background: the same registration is deregistered on shutdown, before any heartbeat ran', async () => {
+      stub.hangRegistrationsAfterStoring = true;
+      const appContext = await NestFactory.createApplicationContext(
+        testModule(stub.url, 'background'),
+        { logger: false },
+      );
+      expect(stub.has(instanceId)).toBe(true);
+
+      await appContext.close();
+
+      expect(stub.requests.some((r) => r.method === 'PUT')).toBe(false);
+      expect(deletes(stub)).toBe(1);
+      expect(stub.has(instanceId)).toBe(false);
+    }, 20_000);
+
+    it('fail-fast, two servers: A stores then hangs, B answers 400 — bootstrap rejects with B’s error, and both A and B get a DELETE', async () => {
+      const serverA = new EurekaStubServer();
+      const serverB = new EurekaStubServer();
+      await serverA.listen();
+      await serverB.listen();
+      serverA.hangRegistrationsAfterStoring = true;
+      serverB.rejectRegistrations = true;
+
+      try {
+        await expect(
+          NestFactory.createApplicationContext(
+            testModule([serverA.url, serverB.url]),
+            { logger: false },
+          ),
+        ).rejects.toThrow(/status 400/);
+      } finally {
+        await serverA.close();
+        await serverB.close();
+      }
+
+      expect(deletes(serverA)).toBe(1);
+      expect(deletes(serverB)).toBe(1);
+      expect(serverA.has(instanceId)).toBe(false);
+    }, 20_000);
+
+    // Composition check (#16 + #17): no immediate cleanup on an overall
+    // success, and shutdown fan-out still reaches A. Not a #16 regression
+    // guard on its own — `registered` already owes this DELETE.
+    it('two servers: A stores then hangs, B succeeds — bootstrap succeeds, and shutdown DELETEs from both', async () => {
+      const serverA = new EurekaStubServer();
+      const serverB = new EurekaStubServer();
+      await serverA.listen();
+      await serverB.listen();
+      serverA.hangRegistrationsAfterStoring = true;
+
+      try {
+        const appContext = await NestFactory.createApplicationContext(
+          testModule([serverA.url, serverB.url]),
+          { logger: false },
+        );
+        expect(serverA.has(instanceId)).toBe(true);
+        expect(serverB.has(instanceId)).toBe(true);
+        expect(deletes(serverA) + deletes(serverB)).toBe(0); // no immediate cleanup
+
+        await appContext.close();
+      } finally {
+        await serverA.close();
+        await serverB.close();
+      }
+
+      expect(deletes(serverA)).toBe(1);
+      expect(deletes(serverB)).toBe(1);
+      expect(serverA.has(instanceId)).toBe(false);
+      expect(serverB.has(instanceId)).toBe(false);
+    }, 20_000);
+  });
 });

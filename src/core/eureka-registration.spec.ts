@@ -1,5 +1,6 @@
 import type { EurekaClient, RenewResult } from './eureka-client';
 import { EurekaRegistration } from './eureka-registration';
+import { EurekaRequestError } from './errors';
 import type { EurekaLogger } from './logger';
 
 function createDeferred<T>() {
@@ -14,9 +15,27 @@ function createDeferred<T>() {
 
 function createClientMock() {
   return {
-    register: jest.fn<Promise<void>, [AbortSignal?]>(),
+    register: jest.fn<Promise<void>, [AbortSignal?, (() => void)?]>(),
     renew: jest.fn<Promise<RenewResult>, [AbortSignal?]>(),
     deregister: jest.fn<Promise<void>, []>(),
+  };
+}
+
+function registerError(status?: number): EurekaRequestError {
+  return new EurekaRequestError('Eureka register request failed', {
+    operation: 'register',
+    method: 'POST',
+    url: 'http://localhost:8761/eureka/apps/MY-APP',
+    status,
+  });
+}
+
+/** Like the real client on a timeout/transport failure/5xx: reports the
+ *  attempt as ambiguous, then rejects with `error`. */
+function ambiguousRegisterFailure(error: Error = registerError()) {
+  return (_signal?: AbortSignal, onAmbiguousAttempt?: () => void) => {
+    onAmbiguousAttempt?.();
+    return Promise.reject(error);
   };
 }
 
@@ -374,12 +393,13 @@ describe('EurekaRegistration', () => {
       );
     });
 
-    it('stop() after a failed start() resolves without sending a DELETE', async () => {
+    it('stop() after a definitively rejected start() (4xx) resolves without sending a DELETE', async () => {
       const client = createClientMock();
-      client.register.mockRejectedValue(new Error('registration failed'));
+      const error = registerError(400);
+      client.register.mockRejectedValue(error);
       const registration = newRegistration(client, 1000, createLoggerMock());
 
-      await expect(registration.start()).rejects.toThrow('registration failed');
+      await expect(registration.start()).rejects.toBe(error);
       await expect(registration.stop()).resolves.toBeUndefined();
 
       expect(client.deregister).not.toHaveBeenCalled();
@@ -472,9 +492,9 @@ describe('EurekaRegistration', () => {
       expect(logger.warn).not.toHaveBeenCalled();
     });
 
-    it('background, never registered: stop() aborting a hanging renew sends no DELETE', async () => {
+    it('background, definitively rejected initial register: stop() aborting a hanging renew sends no DELETE', async () => {
       const client = createClientMock();
-      client.register.mockRejectedValueOnce(new Error('eureka unreachable'));
+      client.register.mockRejectedValueOnce(registerError(400));
       client.renew.mockImplementation(hangUntilAborted<RenewResult>());
       const logger = createLoggerMock();
       const registration = newRegistration(client, 1000, logger, 'background');
@@ -599,10 +619,11 @@ describe('EurekaRegistration', () => {
       expect(client.deregister).toHaveBeenCalledTimes(1);
     });
 
-    it('keeps retrying on the heartbeat cadence with a single timer while Eureka stays down, and sends no DELETE', async () => {
+    it('keeps retrying on the heartbeat cadence with a single timer while Eureka stays down, then sends one best-effort DELETE (the initial outcome was never reconciled, #16)', async () => {
       const client = createClientMock();
-      client.register.mockRejectedValue(new Error('eureka unreachable'));
+      client.register.mockImplementation(ambiguousRegisterFailure());
       client.renew.mockRejectedValue(new Error('eureka unreachable'));
+      client.deregister.mockResolvedValue(undefined);
       const registration = newBackgroundRegistration(client);
       await registration.start();
       expect(jest.getTimerCount()).toBe(1);
@@ -613,7 +634,7 @@ describe('EurekaRegistration', () => {
       expect(jest.getTimerCount()).toBe(1);
 
       await registration.stop();
-      expect(client.deregister).not.toHaveBeenCalled();
+      expect(client.deregister).toHaveBeenCalledTimes(1);
       expect(jest.getTimerCount()).toBe(0);
     });
 
@@ -672,7 +693,7 @@ describe('EurekaRegistration', () => {
 
     it('stop() during an in-flight renew that then succeeds still sends the owed DELETE (initial POST had silently succeeded)', async () => {
       const client = createClientMock();
-      client.register.mockRejectedValueOnce(new Error('timed out'));
+      client.register.mockImplementationOnce(ambiguousRegisterFailure());
       const renewDeferred = createDeferred<RenewResult>();
       client.renew.mockReturnValueOnce(renewDeferred.promise);
       client.deregister.mockResolvedValue(undefined);
@@ -721,6 +742,253 @@ describe('EurekaRegistration', () => {
         undefined,
       ]);
       expect(client.register).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('ambiguous register outcomes are always cleaned up (#16)', () => {
+    describe('fail-fast', () => {
+      it('an ambiguous initial failure deregisters before start() rejects, with the original error', async () => {
+        const client = createClientMock();
+        const error = registerError();
+        client.register.mockImplementation(ambiguousRegisterFailure(error));
+        const order: string[] = [];
+        client.deregister.mockImplementation(() => {
+          order.push('deregister');
+          return Promise.resolve();
+        });
+        const registration = newRegistration(client, 1000, createLoggerMock());
+
+        const startPromise = registration.start().catch((e: unknown) => {
+          order.push('rejected');
+          throw e;
+        });
+
+        await expect(startPromise).rejects.toBe(error);
+        expect(order).toEqual(['deregister', 'rejected']);
+        await expect(registration.start()).rejects.toThrow(
+          /cannot be restarted/,
+        );
+      });
+
+      it('a failed cleanup never replaces the original error, is logged, and is not retried by stop()', async () => {
+        const client = createClientMock();
+        const error = registerError(503);
+        client.register.mockImplementation(ambiguousRegisterFailure(error));
+        client.deregister.mockRejectedValue(new Error('still unreachable'));
+        const logger = createLoggerMock();
+        const registration = newRegistration(client, 1000, logger);
+
+        await expect(registration.start()).rejects.toBe(error);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('still unreachable'),
+        );
+
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('a throwing logger during a failed cleanup still never replaces the original error', async () => {
+        const client = createClientMock();
+        const error = registerError();
+        client.register.mockImplementation(ambiguousRegisterFailure(error));
+        client.deregister.mockRejectedValue(new Error('still unreachable'));
+        const throwingLogger: EurekaLogger = {
+          log: jest.fn(),
+          warn: jest.fn(() => {
+            throw new Error('logger is broken');
+          }),
+          error: jest.fn(),
+        };
+        const registration = newRegistration(client, 1000, throwingLogger);
+
+        await expect(registration.start()).rejects.toBe(error);
+        expect(throwingLogger.warn).toHaveBeenCalledTimes(1);
+      });
+
+      it('stop() landing during the cleanup waits for it and sends no second DELETE', async () => {
+        const client = createClientMock();
+        const error = registerError();
+        client.register.mockImplementation(ambiguousRegisterFailure(error));
+        const deregisterDeferred = createDeferred<void>();
+        client.deregister.mockReturnValue(deregisterDeferred.promise);
+        const registration = newRegistration(client, 1000, createLoggerMock());
+
+        const startPromise = registration.start();
+        startPromise.catch(() => undefined);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+
+        let stopped = false;
+        const stopPromise = registration.stop().then(() => {
+          stopped = true;
+        });
+        await jest.advanceTimersByTimeAsync(0);
+        expect(stopped).toBe(false);
+
+        deregisterDeferred.resolve();
+        await expect(startPromise).rejects.toBe(error);
+        await stopPromise;
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('stop() aborting an in-flight register that then reports ambiguity: stop() owns the cleanup, exactly one DELETE', async () => {
+        const client = createClientMock();
+        const abortError = registerError();
+        client.register.mockImplementation(
+          (signal?: AbortSignal, onAmbiguousAttempt?: () => void) =>
+            new Promise<void>((_resolve, reject) => {
+              signal?.addEventListener(
+                'abort',
+                () => {
+                  onAmbiguousAttempt?.();
+                  reject(abortError);
+                },
+                { once: true },
+              );
+            }),
+        );
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newRegistration(client, 1000, createLoggerMock());
+
+        const startPromise = registration.start();
+        const stopPromise = registration.stop();
+
+        await expect(startPromise).rejects.toBe(abortError);
+        await stopPromise;
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('repeated ambiguous attempts in one register (A timeout, B 503, C 400) still mean exactly one deregister()', async () => {
+        const client = createClientMock();
+        const finalError = registerError(400);
+        client.register.mockImplementation(
+          (_signal?: AbortSignal, onAmbiguousAttempt?: () => void) => {
+            onAmbiguousAttempt?.(); // A: timeout
+            onAmbiguousAttempt?.(); // B: 503
+            return Promise.reject(finalError); // C: 400
+          },
+        );
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newRegistration(client, 1000, createLoggerMock());
+
+        await expect(registration.start()).rejects.toBe(finalError);
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      // Guards "no immediate cleanup on success"; the shutdown DELETE itself
+      // is already owed via `registered` — the sticky test below is what
+      // guards #16 for this path.
+      it('an ambiguous attempt inside an overall-successful register triggers no immediate cleanup; shutdown deregisters once', async () => {
+        const client = createClientMock();
+        client.register.mockImplementation(
+          (_signal?: AbortSignal, onAmbiguousAttempt?: () => void) => {
+            onAmbiguousAttempt?.(); // A: timeout
+            return Promise.resolve(); // B: 204
+          },
+        );
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newRegistration(client, 1000, createLoggerMock());
+
+        await expect(registration.start()).resolves.toBeUndefined();
+        expect(client.deregister).not.toHaveBeenCalled();
+
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('cleanup-owed is sticky: a later register success, renew 200, renew 404 and definitive re-register failure do not clear it', async () => {
+        const client = createClientMock();
+        client.register
+          .mockImplementationOnce(
+            (_signal?: AbortSignal, onAmbiguousAttempt?: () => void) => {
+              onAmbiguousAttempt?.(); // A: timeout, but A stored it
+              return Promise.resolve(); // B: 204
+            },
+          )
+          .mockRejectedValueOnce(registerError(400)); // re-register after 404
+        client.renew
+          .mockResolvedValueOnce('renewed') // B: 200
+          .mockResolvedValueOnce('not-found') // B: 404
+          .mockRejectedValue(new Error('unreachable'));
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newRegistration(client, 1000, createLoggerMock());
+        await registration.start();
+
+        await jest.advanceTimersByTimeAsync(2000);
+        expect(client.register).toHaveBeenCalledTimes(2);
+
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('background', () => {
+      function newBackgroundRegistration(client: ClientMock) {
+        return newRegistration(client, 1000, createLoggerMock(), 'background');
+      }
+
+      it('an ambiguous initial failure followed by stop() before any heartbeat sends one DELETE', async () => {
+        const client = createClientMock();
+        client.register.mockImplementation(ambiguousRegisterFailure());
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newBackgroundRegistration(client);
+
+        await registration.start();
+        await registration.stop();
+
+        expect(client.renew).not.toHaveBeenCalled();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('a definitive initial failure followed by stop() before any heartbeat sends no DELETE', async () => {
+        const client = createClientMock();
+        client.register.mockRejectedValue(registerError(400));
+        const registration = newBackgroundRegistration(client);
+
+        await registration.start();
+        await registration.stop();
+
+        expect(client.deregister).not.toHaveBeenCalled();
+      });
+
+      it('a renew 404 does not clear an earlier ambiguous initial failure', async () => {
+        const client = createClientMock();
+        client.register
+          .mockImplementationOnce(ambiguousRegisterFailure())
+          .mockRejectedValueOnce(registerError(400));
+        client.renew
+          .mockResolvedValueOnce('not-found')
+          .mockRejectedValue(new Error('unreachable'));
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newBackgroundRegistration(client);
+        await registration.start();
+
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(client.register).toHaveBeenCalledTimes(2);
+
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
+
+      it('an ambiguous 404-triggered re-register followed by stop() sends one DELETE', async () => {
+        const client = createClientMock();
+        client.register
+          .mockResolvedValueOnce(undefined)
+          .mockImplementationOnce(ambiguousRegisterFailure());
+        client.renew
+          .mockResolvedValueOnce('not-found')
+          .mockRejectedValue(new Error('unreachable'));
+        client.deregister.mockResolvedValue(undefined);
+        const registration = newBackgroundRegistration(client);
+        await registration.start();
+
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(client.register).toHaveBeenCalledTimes(2);
+
+        await registration.stop();
+        expect(client.deregister).toHaveBeenCalledTimes(1);
+      });
     });
   });
 });

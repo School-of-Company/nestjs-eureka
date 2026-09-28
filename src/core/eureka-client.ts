@@ -22,24 +22,48 @@ export class EurekaClient {
 
   constructor(private readonly resolved: ResolvedEurekaOptions) {}
 
-  /** `signal` lets the caller cancel the request early, on top of `requestTimeoutMs`. */
-  async register(signal?: AbortSignal): Promise<void> {
+  /**
+   * `signal` lets the caller cancel the request early, on top of
+   * `requestTimeoutMs`.
+   *
+   * `onAmbiguousAttempt` is called once per attempt whose remote outcome is
+   * unknown — no HTTP status (transport failure, timeout, or `signal`
+   * abort) or a 5xx — because that server may have applied the POST even
+   * though no success reached us. It's per attempt, not per operation: with
+   * failover, a timeout on one server followed by a 4xx (or even a 2xx) from
+   * another still reports the first. A 4xx/3xx is a definitive rejection and
+   * is never reported. Thrown errors are never wrapped or replaced.
+   */
+  async register(
+    signal?: AbortSignal,
+    onAmbiguousAttempt?: () => void,
+  ): Promise<void> {
     await this.withFailover(signal, async (server) => {
-      const url = this.appUrl(server, this.resolved.instance.eurekaAppName);
-      const response = await this.rawFetch(
-        'register',
-        'POST',
-        url,
-        {
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildRegistrationBody(this.resolved)),
-        },
-        signal,
-        server.authorizationHeader,
-      );
-      await this.drain(response);
-      if (!response.ok) {
-        throw this.statusError('register', 'POST', url, response);
+      try {
+        const url = this.appUrl(server, this.resolved.instance.eurekaAppName);
+        const response = await this.rawFetch(
+          'register',
+          'POST',
+          url,
+          {
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(buildRegistrationBody(this.resolved)),
+          },
+          signal,
+          server.authorizationHeader,
+        );
+        await this.drain(response);
+        if (!response.ok) {
+          throw this.statusError('register', 'POST', url, response);
+        }
+      } catch (error) {
+        if (
+          error instanceof EurekaRequestError &&
+          (error.status === undefined || error.status >= 500)
+        ) {
+          onAmbiguousAttempt?.();
+        }
+        throw error;
       }
     });
   }
