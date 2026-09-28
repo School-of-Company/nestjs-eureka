@@ -127,7 +127,10 @@ export class EurekaRegistration {
     if (this.registered || interruptedRegister) {
       try {
         // Deliberately no cancellation signal: the active one is already
-        // aborted; this request gets only its own requestTimeoutMs.
+        // aborted. With one configured server this is one request, bounded
+        // by requestTimeoutMs; with several, deregister() attempts every
+        // one of them sequentially (see #17), up to
+        // serviceUrls.length * requestTimeoutMs in the worst case.
         await this.client.deregister();
       } catch (error) {
         this.logger.warn(

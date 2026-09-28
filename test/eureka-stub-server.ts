@@ -28,6 +28,11 @@ export class EurekaStubServer {
   /** Incremented synchronously whenever a hanging renewal request arrives,
    *  so a test can deterministically wait for one to actually be in flight. */
   hangingRenewalCount = 0;
+  /** When true, discovery (GET /apps/{app}) requests get a 503 — used to
+   *  force a discovery-only failover to another configured server, without
+   *  touching this server's actual registry (registration/renewal/
+   *  deregistration are unaffected). */
+  failDiscovery = false;
   private port = 0;
   private closed = false;
 
@@ -123,6 +128,10 @@ export class EurekaStubServer {
       return;
     }
     if (method === 'GET' && !instanceId) {
+      if (this.failDiscovery) {
+        res.writeHead(503).end();
+        return;
+      }
       const instances = [...this.registry.values()].filter(
         (i) => i.app === app,
       );
