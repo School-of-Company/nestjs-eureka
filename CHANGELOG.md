@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-28
+
+First published release.
+
 ### Added
 
 - `EurekaModule.forRoot()` / `.forRootAsync()` (`useFactory`/`useClass`/`useExisting`) — NestJS integration for Netflix Eureka.
@@ -30,3 +34,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - With multiple configured `serviceUrl` servers, `deregister()` used to stop at whichever server was currently preferred and treat a 404 there as done — since the preferred server is just a best-effort hint that an unrelated `getInstances()` call can move, this could leave the actual registration behind on a different, independent server until its lease expired. `deregister()` now attempts every configured server, unconditionally, on shutdown. One side effect: if any single configured server is unreachable at shutdown, that now always surfaces as a logged warning, even when every other server's deregistration succeeded (previously, one success anywhere silenced the rest).
 - A redirect (3xx) response from Eureka (or a proxy in front of it) was silently followed by `fetch`'s default `redirect: 'follow'` behavior — a redirected `POST`/`PUT` is replayed as a `GET`, dropping the body, so `response.ok` ended up reflecting whatever the redirect target returned rather than the original request, making a registration that never actually landed look like a success. Redirects are no longer followed; a 3xx now throws a clear `EurekaRequestError` naming the status code.
 - A registration that failed on its own with an unknown outcome — a timeout, network error, or 5xx, where Eureka may have applied the `POST` even though no success reached the client — was never deregistered: only a registration cancelled by shutdown was treated that way. In fail-fast mode this left a phantom `UP` instance behind after a failed bootstrap (Nest never runs shutdown hooks then); in background mode, shutting down before a heartbeat reconciled it did the same. This is now tracked per register *attempt*, not by the final error: with multiple servers, a timeout on one server followed by a 4xx (or a success) from another still counts. Such a registration now always gets one best-effort deregistration attempt (which, as above, reaches every configured server; a failed attempt is logged, not retried), and a later heartbeat answer from a single server never cancels that. Behavior changes: a fail-fast bootstrap failure after such a registration now waits for that deregistration (up to `serviceUrls.length × requestTimeoutMs`) before rejecting, still with the original registration error; and background mode with Eureka unreachable the whole time now attempts a deregistration on shutdown (previously none), which may itself time out and log a warning — shutdown can take up to `serviceUrls.length × requestTimeoutMs` longer.
+
+[Unreleased]: https://github.com/School-of-Company/nestjs-eureka/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/School-of-Company/nestjs-eureka/releases/tag/v0.1.0
