@@ -33,6 +33,13 @@ export class EurekaStubServer {
    *  touching this server's actual registry (registration/renewal/
    *  deregistration are unaffected). */
   failDiscovery = false;
+  /** When true, a discovery (GET /apps/{app}) request that would otherwise
+   *  answer 200 instead sends response headers plus a partial JSON body,
+   *  then hangs — the client's own `requestTimeoutMs` is what ends it,
+   *  exercising a timeout mid-body-read rather than a fast, fully-formed
+   *  bad response (#18). Ignored if `failDiscovery` is set, or if there's
+   *  nothing registered (still a 404, matching normal discovery). */
+  hangDiscoveryBodyAfterHeaders = false;
   /** When set, every POST (registration) gets a 301 to this path instead of
    *  being registered — simulates an ingress/proxy in front of Eureka that
    *  redirects, e.g. an http-to-https rewrite. Takes precedence over
@@ -166,6 +173,10 @@ export class EurekaStubServer {
         return;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (this.hangDiscoveryBodyAfterHeaders) {
+        res.write('{"application":'); // deliberately never finished
+        return;
+      }
       res.end(
         JSON.stringify({ application: { name: app, instance: instances } }),
       );

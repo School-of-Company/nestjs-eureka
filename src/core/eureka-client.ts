@@ -10,6 +10,30 @@ import type { ParsedServiceUrl } from './service-url';
 export type RenewResult = 'renewed' | 'not-found';
 
 /**
+ * `response.json()` rejects with this shape when the request's signal
+ * (here, always the internal `requestTimeoutMs` timer for discovery — see
+ * `getInstances()`) aborts while the body is still being read, *after*
+ * `fetch()` itself already resolved with headers/status. Empirically
+ * verified across Node 20.3.0, 22, and 26 (#18): a genuinely malformed body
+ * always rejects with a `SyntaxError`, never one of these two names — Node
+ * 20.3.0 names this `AbortError` for an `AbortSignal.timeout()` firing
+ * mid-body-read, while 22+ names it `TimeoutError`; a caller-initiated
+ * abort (not currently used by `getInstances()`, but checked here too in
+ * case that ever changes) is `AbortError` on every version tested.
+ *
+ * Duck-typed on `.name` rather than `error instanceof DOMException`/`Error`
+ * — deliberately, not just defensively: `DOMException` is not reliably
+ * `instanceof` the calling realm's `Error` across every JS host (confirmed
+ * directly — Jest's sandboxed `node` test environment is one such case,
+ * despite plain Node itself passing that check).
+ */
+function isBodyReadTimeoutOrAbort(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const name = (error as { name?: unknown }).name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
+/**
  * HTTP calls against the Eureka REST API, with failover across
  * `resolved.serviceUrls` when there's more than one. No lifecycle state, no
  * scheduling — that's `EurekaRegistration`'s job. The only state this class
@@ -171,6 +195,19 @@ export class EurekaClient {
       try {
         body = await response.json();
       } catch (cause) {
+        if (isBodyReadTimeoutOrAbort(cause)) {
+          // Headers (and `response.status`/`.ok`, already checked above)
+          // arrived, but the body itself didn't within requestTimeoutMs (or
+          // the request's signal was otherwise aborted while reading it) —
+          // a transport-level failure, not a malformed payload from a
+          // reachable node. Status-less, like a `rawFetch` transport
+          // failure, so `withFailover` retries the next server instead of
+          // treating this the same as genuinely malformed JSON.
+          throw new EurekaRequestError(
+            'Eureka discovery request timed out while reading the response body',
+            { operation: 'discovery', method: 'GET', url, cause },
+          );
+        }
         throw new EurekaRequestError(
           'Eureka discovery response was not valid JSON',
           {

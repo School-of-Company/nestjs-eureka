@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- If a Eureka server sent `200` response headers but then streamed the discovery body slowly enough to exceed `requestTimeoutMs`, `getInstances()` treated the resulting body-read timeout exactly like a genuinely malformed body — a terminal error attached to the `200` status — instead of failing over to another configured server the way a timeout anywhere else does. A body-read timeout (or abort) is now detected and thrown as a status-less error, so `withFailover` retries the next server; a genuinely malformed body from a fast, fully-formed response is unaffected and still fails without failing over.
+
 - `heartbeatIntervalSeconds`, `leaseDurationSeconds`, and `requestTimeoutMs` accepted any positive integer, with no upper bound. A value large enough to overflow Node's 32-bit signed timer-delay limit (2,147,483,647ms) didn't fail loudly: `setTimeout` silently clamps such a delay to ~1ms — turning a long heartbeat interval into a hot loop that renews roughly every millisecond instead of the intended interval — and `AbortSignal.timeout` throws a `RangeError` from inside a request, wrapped as a generic, misleading transport failure. These three options are now rejected at configuration time if they (or, for `heartbeatIntervalSeconds`, their millisecond conversion) would exceed that limit.
 
 ## [0.1.0] - 2026-09-28
