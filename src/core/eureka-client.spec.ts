@@ -218,6 +218,52 @@ describe('EurekaClient', () => {
     );
   });
 
+  describe('getInstances(): a body-read timeout/abort is not a parse error (#18)', () => {
+    it.each(['TimeoutError', 'AbortError'])(
+      'a %s while reading the body is status-less (retryable), not the malformed-JSON error',
+      async (name) => {
+        const abortLike = new DOMException('The operation was aborted', name);
+        fetchMock.mockResolvedValue(
+          mockResponse({
+            ok: true,
+            status: 200,
+            json: () => Promise.reject(abortLike),
+          }),
+        );
+        const client = new EurekaClient(resolved);
+
+        const error = await client
+          .getInstances('other-app')
+          .catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(EurekaRequestError);
+        expect((error as EurekaRequestError).status).toBeUndefined();
+        expect((error as EurekaRequestError).cause).toBe(abortLike);
+        expect((error as EurekaRequestError).message).not.toMatch(/valid JSON/);
+      },
+    );
+
+    it('a genuine SyntaxError (malformed body from a reachable node) still carries the response status', async () => {
+      const syntaxError = new SyntaxError("Unexpected token 'o'");
+      fetchMock.mockResolvedValue(
+        mockResponse({
+          ok: true,
+          status: 200,
+          json: () => Promise.reject(syntaxError),
+        }),
+      );
+      const client = new EurekaClient(resolved);
+
+      const error = await client
+        .getInstances('other-app')
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBe(200);
+      expect((error as EurekaRequestError).cause).toBe(syntaxError);
+    });
+  });
+
   it('never leaks credentials in a thrown error even when the underlying network error mentions them', async () => {
     fetchMock.mockRejectedValue(
       new Error('connect ECONNREFUSED to http://user:hunter2@localhost:8761'),
@@ -699,6 +745,32 @@ describe('EurekaClient', () => {
       expect(error).toBeInstanceOf(EurekaRequestError);
       expect((error as EurekaRequestError).status).toBe(200);
       expect(fetchMock).toHaveBeenCalledTimes(1); // B never contacted
+    });
+
+    it('a body-read timeout on A fails over to B (#18) — unlike a genuinely malformed body, which does not', async () => {
+      const client = twoServerClient();
+      const timeoutError = new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError',
+      );
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockResponse({
+                ok: true,
+                status: 200,
+                json: () => Promise.reject(timeoutError),
+              })
+            : mockResponse({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ application: { instance: [] } }),
+              }),
+        ),
+      );
+
+      await expect(client.getInstances('other-app')).resolves.toEqual([]);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // B was actually tried
     });
 
     it("throws the last server's error when all servers fail, having tried each exactly once", async () => {

@@ -356,6 +356,62 @@ describe('Eureka registration (e2e)', () => {
     expect(stub.requests.filter((r) => r.method === 'GET')).toHaveLength(0);
   }, 20_000);
 
+  it('a discovery response whose body read times out fails over to the next server, instead of being treated as malformed JSON (#18)', async () => {
+    const instanceId = 'host-1:my-app:3000';
+    const serverA = new EurekaStubServer();
+    const serverB = new EurekaStubServer();
+    await serverA.listen();
+    await serverB.listen();
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: [serverA.url, serverB.url],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+            instanceId,
+          },
+          // Long enough that no heartbeat can fire during the test — this
+          // is entirely about a discovery call, not the heartbeat/renew path.
+          heartbeatIntervalSeconds: 30,
+          leaseDurationSeconds: 90,
+          requestTimeoutMs: 500,
+        }),
+      ],
+    })
+    class TestModule {}
+
+    const appContext = await NestFactory.createApplicationContext(TestModule, {
+      logger: false,
+    });
+
+    try {
+      // The registration lives only on A — irrelevant to this test beyond
+      // making A's discovery response non-404 (headers + a body it never
+      // finishes), which is what actually exercises the body-read timeout.
+      await waitFor(() => serverA.requests.some((r) => r.method === 'POST'));
+      serverA.hangDiscoveryBodyAfterHeaders = true;
+
+      const service = appContext.get(EurekaService);
+      // Before the fix: A's 200 status makes the resulting error terminal
+      // (misclassified as malformed JSON), and this rejects without ever
+      // reaching B. After the fix: A's body-read timeout is status-less,
+      // failover reaches B, and B (which never had this instance) answers
+      // 404 -> [].
+      await expect(service.getInstances('my-app')).resolves.toEqual([]);
+    } finally {
+      await appContext.close();
+      await serverA.close();
+      await serverB.close();
+    }
+
+    expect(serverA.requests.filter((r) => r.method === 'GET')).toHaveLength(1);
+    expect(serverB.requests.filter((r) => r.method === 'GET')).toHaveLength(1); // confirms B was actually reached, not just A failing
+  }, 20_000);
+
   describe('a registration whose outcome is unknown is always cleaned up (#16)', () => {
     const instanceId = 'host-1:my-app:3000';
 
