@@ -34,9 +34,11 @@ export interface EurekaClientOptions {
    */
   serviceUrl: string | string[];
   instance: EurekaInstanceOptions;
-  /** Default 30. Must be smaller than `leaseDurationSeconds`. */
+  /** Default 30. Must be smaller than `leaseDurationSeconds`, and at most
+   *  2_147_483 (any larger would overflow Node's 32-bit timer delay once
+   *  converted to milliseconds). */
   heartbeatIntervalSeconds?: number;
-  /** Default 90. */
+  /** Default 90. At most 2_147_483_647 (the 32-bit signed integer max). */
   leaseDurationSeconds?: number;
   /**
    * Default `'fail-fast'`: a failed initial registration rejects application
@@ -44,7 +46,9 @@ export interface EurekaClientOptions {
    * and registration is retried on the heartbeat schedule until it succeeds.
    */
   registrationMode?: 'fail-fast' | 'background';
-  /** Default 5000. Timeout for each individual Eureka HTTP request, in milliseconds. */
+  /** Default 5000. Timeout for each individual Eureka HTTP request, in
+   *  milliseconds. At most 2_147_483_647 (Node's 32-bit timer delay limit;
+   *  `AbortSignal.timeout` throws above this). */
   requestTimeoutMs?: number;
 }
 
@@ -90,6 +94,26 @@ function requirePositiveInteger(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new Error(
       `Eureka configuration: "${field}" must be a positive integer`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Node's `setTimeout`/`setInterval`/`AbortSignal.timeout` delay is a 32-bit
+ * signed integer of milliseconds. Above this, `setTimeout` silently clamps
+ * the delay to ~1ms (a `heartbeatIntervalSeconds` this large would turn the
+ * heartbeat loop into a hot loop, not throw), and `AbortSignal.timeout`
+ * throws a `RangeError` from inside `rawFetch()` — a confusing, generic
+ * transport failure that gives no hint the configured value itself is the
+ * problem. Reject at configuration time instead. (#19)
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647; // 2^31 - 1
+
+function requireAtMost(value: number, field: string, max: number): number {
+  if (value > max) {
+    throw new Error(
+      `Eureka configuration: "${field}" must not exceed ${max} (Node's 32-bit timer-delay limit)`,
     );
   }
   return value;
@@ -181,13 +205,23 @@ export function resolveOptions(
       ? `${hostName}:${app}:${port}`
       : requireNonEmptyString(instanceInput.instanceId, 'instance.instanceId');
 
-  const heartbeatIntervalSeconds = requirePositiveInteger(
-    options.heartbeatIntervalSeconds ?? 30,
+  const heartbeatIntervalSeconds = requireAtMost(
+    requirePositiveInteger(
+      options.heartbeatIntervalSeconds ?? 30,
+      'heartbeatIntervalSeconds',
+    ),
     'heartbeatIntervalSeconds',
+    // Converted to ms before use as a timer delay — bound the seconds value
+    // so that conversion can't overflow.
+    Math.floor(MAX_TIMER_DELAY_MS / 1000),
   );
-  const leaseDurationSeconds = requirePositiveInteger(
-    options.leaseDurationSeconds ?? 90,
+  const leaseDurationSeconds = requireAtMost(
+    requirePositiveInteger(
+      options.leaseDurationSeconds ?? 90,
+      'leaseDurationSeconds',
+    ),
     'leaseDurationSeconds',
+    MAX_TIMER_DELAY_MS,
   );
   if (heartbeatIntervalSeconds >= leaseDurationSeconds) {
     throw new Error(
@@ -207,9 +241,13 @@ export function resolveOptions(
     heartbeatIntervalMs: heartbeatIntervalSeconds * 1000,
     leaseDurationSeconds,
     registrationMode,
-    requestTimeoutMs: requirePositiveInteger(
-      options.requestTimeoutMs ?? 5_000,
+    requestTimeoutMs: requireAtMost(
+      requirePositiveInteger(
+        options.requestTimeoutMs ?? 5_000,
+        'requestTimeoutMs',
+      ),
       'requestTimeoutMs',
+      MAX_TIMER_DELAY_MS,
     ),
     instance: {
       eurekaAppName: app.toUpperCase(),

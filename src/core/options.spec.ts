@@ -86,6 +86,59 @@ describe('resolveOptions', () => {
     expect(() => resolveOptions(options)).toThrow(/requestTimeoutMs/);
   });
 
+  describe('timer-delay upper bound (#19)', () => {
+    // Node's setTimeout/AbortSignal.timeout delay is a 32-bit signed integer
+    // of ms — above this, a timer silently clamps instead of throwing.
+    const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+    it('accepts requestTimeoutMs at the boundary', () => {
+      const options = baseOptions();
+      options.requestTimeoutMs = MAX_TIMER_DELAY_MS;
+      expect(resolveOptions(options).requestTimeoutMs).toBe(MAX_TIMER_DELAY_MS);
+    });
+
+    it('rejects requestTimeoutMs just above the boundary', () => {
+      const options = baseOptions();
+      options.requestTimeoutMs = MAX_TIMER_DELAY_MS + 1;
+      expect(() => resolveOptions(options)).toThrow(/requestTimeoutMs/);
+    });
+
+    it('accepts leaseDurationSeconds at the boundary', () => {
+      const options = baseOptions();
+      options.leaseDurationSeconds = MAX_TIMER_DELAY_MS;
+      expect(resolveOptions(options).leaseDurationSeconds).toBe(
+        MAX_TIMER_DELAY_MS,
+      );
+    });
+
+    it('rejects leaseDurationSeconds just above the boundary', () => {
+      const options = baseOptions();
+      options.leaseDurationSeconds = MAX_TIMER_DELAY_MS + 1;
+      expect(() => resolveOptions(options)).toThrow(/leaseDurationSeconds/);
+    });
+
+    // Stated as a literal, not re-derived from MAX_TIMER_DELAY_MS via the
+    // same `/1000` expression the source uses — an independent check of the
+    // boundary arithmetic, not a re-run of the implementation's own formula.
+    const maxHeartbeatSeconds = 2_147_483;
+
+    it('accepts heartbeatIntervalSeconds at the boundary (converts to <= the ms limit)', () => {
+      const options = baseOptions();
+      options.heartbeatIntervalSeconds = maxHeartbeatSeconds;
+      options.leaseDurationSeconds = MAX_TIMER_DELAY_MS; // stay above the heartbeat
+      expect(resolveOptions(options).heartbeatIntervalMs).toBe(
+        maxHeartbeatSeconds * 1000,
+      );
+    });
+
+    it('rejects a heartbeatIntervalSeconds whose ms conversion would just overflow the boundary', () => {
+      const options = baseOptions();
+      options.heartbeatIntervalSeconds = maxHeartbeatSeconds + 1;
+      options.leaseDurationSeconds = MAX_TIMER_DELAY_MS;
+      expect(() => resolveOptions(options)).toThrow(/heartbeatIntervalSeconds/);
+    });
+  });
+
   it('accepts registrationMode "background"', () => {
     const options = baseOptions();
     options.registrationMode = 'background';
