@@ -252,12 +252,21 @@ export class EurekaClient {
     };
     if (authorizationHeader) headers.Authorization = authorizationHeader;
 
+    let response: Response;
     try {
       const timeoutSignal = AbortSignal.timeout(this.resolved.requestTimeoutMs);
-      return await fetch(url, {
+      response = await fetch(url, {
         method,
         headers,
         body: init?.body,
+        // Never follow a redirect. The Fetch spec silently replays a POST as
+        // a GET on a 301/302, dropping the body — a Eureka server or proxy
+        // that redirects register()/renew() would then have `response.ok`
+        // reflect whatever the redirect target happens to return, making a
+        // registration that never actually landed look like a success.
+        // `'manual'` (not `'error'`) so this surfaces through the normal
+        // response-based path below, not the transport-failure catch.
+        redirect: 'manual',
         signal: callerSignal
           ? AbortSignal.any([timeoutSignal, callerSignal])
           : timeoutSignal,
@@ -270,6 +279,29 @@ export class EurekaClient {
         cause,
       });
     }
+    if (response.status >= 300 && response.status < 400) {
+      // With `redirect: 'manual'`, Node's fetch (undici) returns the real
+      // 3xx response as-is — unlike a browser, it does not hide it behind
+      // an opaque response. Never interpolate the `Location` header's value
+      // into the message: it comes from whatever answered the request, not
+      // from Eureka's own configuration, so it's untrusted the same way raw
+      // input elsewhere in this file is. Given a `status`, this is
+      // classified the same as a 4xx by `withFailover` — a real, definitive
+      // answer from this server (or whatever's in front of it), not
+      // evidence every configured server is broken the same way.
+      await this.drain(response);
+      throw new EurekaRequestError(
+        `Eureka ${operation} request was redirected (status ${response.status}) — redirects are not followed; point serviceUrl at the final URL directly`,
+        {
+          operation,
+          method,
+          url,
+          status: response.status,
+          statusText: response.statusText,
+        },
+      );
+    }
+    return response;
   }
 
   /**
