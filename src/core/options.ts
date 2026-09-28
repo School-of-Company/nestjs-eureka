@@ -90,6 +90,24 @@ function requireNonEmptyString(value: unknown, field: string): string {
   return value;
 }
 
+/**
+ * For the instance identity fields (`app`, `hostName`, `ipAddr`, an explicit
+ * `instanceId`): a whitespace-only value would otherwise pass as "non-empty"
+ * and end up in the registration body and the Eureka URL path. Rejected, not
+ * trimmed — a value that passes is returned exactly as given. `serviceUrl`
+ * deliberately doesn't go through this; `parseServiceUrl()` owns URL
+ * validation. (#13)
+ */
+function requireNonBlankString(value: unknown, field: string): string {
+  const str = requireNonEmptyString(value, field);
+  if (str.trim().length === 0) {
+    throw new Error(
+      `Eureka configuration: "${field}" must not be whitespace-only`,
+    );
+  }
+  return str;
+}
+
 function requirePositiveInteger(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new Error(
@@ -186,12 +204,12 @@ export function resolveOptions(
   const serviceUrls = resolveServiceUrls(options.serviceUrl);
 
   const instanceInput = options.instance;
-  const app = requireNonEmptyString(instanceInput?.app, 'instance.app');
-  const hostName = requireNonEmptyString(
+  const app = requireNonBlankString(instanceInput?.app, 'instance.app');
+  const hostName = requireNonBlankString(
     instanceInput?.hostName,
     'instance.hostName',
   );
-  const ipAddr = requireNonEmptyString(
+  const ipAddr = requireNonBlankString(
     instanceInput?.ipAddr,
     'instance.ipAddr',
   );
@@ -203,7 +221,7 @@ export function resolveOptions(
   const instanceId =
     instanceInput.instanceId === undefined
       ? `${hostName}:${app}:${port}`
-      : requireNonEmptyString(instanceInput.instanceId, 'instance.instanceId');
+      : requireNonBlankString(instanceInput.instanceId, 'instance.instanceId');
 
   const heartbeatIntervalSeconds = requireAtMost(
     requirePositiveInteger(
