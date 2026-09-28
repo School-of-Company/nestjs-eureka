@@ -33,6 +33,11 @@ export class EurekaStubServer {
    *  touching this server's actual registry (registration/renewal/
    *  deregistration are unaffected). */
   failDiscovery = false;
+  /** When set, every POST (registration) gets a 301 to this path instead of
+   *  being registered — simulates an ingress/proxy in front of Eureka that
+   *  redirects, e.g. an http-to-https rewrite. Takes precedence over
+   *  `failRegistrations` if both are set (no test currently combines them). */
+  redirectRegistrationsTo?: string;
   private port = 0;
   private closed = false;
 
@@ -102,6 +107,10 @@ export class EurekaStubServer {
     const instanceId = match[2] ? decodeURIComponent(match[2]) : undefined;
 
     if (method === 'POST' && !instanceId) {
+      if (this.redirectRegistrationsTo) {
+        res.writeHead(301, { Location: this.redirectRegistrationsTo }).end();
+        return;
+      }
       if (this.failRegistrations) {
         res.writeHead(503).end();
         return;

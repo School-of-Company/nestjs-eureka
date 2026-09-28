@@ -323,4 +323,36 @@ describe('Eureka registration (e2e)', () => {
       1,
     );
   }, 20_000);
+
+  it('a redirected registration fails application bootstrap with a clear error, instead of silently "succeeding" (#15)', async () => {
+    // Redirects registration to this same server's own discovery endpoint —
+    // if the redirect were followed (the old, buggy behavior), that GET
+    // would return 404 (nothing registered yet) or, once anything else in
+    // the app registers, 200 — either way `response.ok`/`response.status`
+    // would reflect the discovery GET, not the registration that never
+    // happened, making a broken registration look like a success.
+    stub.redirectRegistrationsTo = `${stub.url}/apps/MY-APP`;
+
+    @Module({
+      imports: [
+        EurekaModule.forRoot({
+          serviceUrl: stub.url,
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '127.0.0.1',
+            port: 3000,
+          },
+        }),
+      ],
+    })
+    class TestModule {}
+
+    await expect(
+      NestFactory.createApplicationContext(TestModule, { logger: false }),
+    ).rejects.toThrow(/redirected/);
+
+    // The redirect was never followed — no GET ever reached the server.
+    expect(stub.requests.filter((r) => r.method === 'GET')).toHaveLength(0);
+  }, 20_000);
 });

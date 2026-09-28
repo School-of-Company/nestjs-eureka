@@ -25,6 +25,26 @@ function mockResponse(init: {
   } as unknown as Response;
 }
 
+/** What Node's fetch (undici) actually resolves with for
+ *  `redirect: 'manual'` on a 3xx — unlike a browser, the real status/headers
+ *  are exposed as-is, not hidden behind an opaque response. Verified
+ *  directly against real undici (a local `node:http` server returning 301). */
+function mockRedirectResponse(
+  status = 301,
+  init?: { body?: { cancel: jest.Mock }; location?: string },
+): Response {
+  return {
+    type: 'basic',
+    ok: false,
+    status,
+    statusText: 'Moved Permanently',
+    body: init?.body,
+    headers: new Headers(
+      init?.location ? { Location: init.location } : undefined,
+    ),
+  } as unknown as Response;
+}
+
 describe('EurekaClient', () => {
   let fetchMock: jest.Mock;
   let resolved: ResolvedEurekaOptions;
@@ -224,6 +244,140 @@ describe('EurekaClient', () => {
     // `cause` is deliberately retained (non-enumerable, for debugging) and does still
     // contain it — that's intentional, it's just never surfaced in message/url/JSON output.
     expect((error!.cause as Error).message).toContain('hunter2');
+  });
+
+  describe('redirects are never followed', () => {
+    it('passes redirect: "manual" on every request', async () => {
+      fetchMock.mockResolvedValue(mockResponse({ ok: true, status: 200 }));
+      const client = new EurekaClient(resolved);
+
+      await client.renew();
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(init.redirect).toBe('manual');
+    });
+
+    it.each(['register', 'renew', 'deregister'] as const)(
+      '%s(): a 3xx response throws a clear, status-carrying EurekaRequestError, not a silent success',
+      async (operation) => {
+        fetchMock.mockResolvedValue(mockRedirectResponse(301));
+        const client = new EurekaClient(resolved);
+
+        const error = await client[operation]().catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(EurekaRequestError);
+        expect((error as EurekaRequestError).operation).toBe(operation);
+        expect((error as EurekaRequestError).message).toContain('redirected');
+        expect((error as EurekaRequestError).status).toBe(301);
+      },
+    );
+
+    it('getInstances(): a 3xx response throws a clear EurekaRequestError', async () => {
+      fetchMock.mockResolvedValue(mockRedirectResponse(302));
+      const client = new EurekaClient(resolved);
+
+      const error = await client
+        .getInstances('other-app')
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).operation).toBe('discovery');
+      expect((error as EurekaRequestError).message).toContain('redirected');
+      expect((error as EurekaRequestError).status).toBe(302);
+    });
+
+    it('never interpolates the Location header value into the error message', async () => {
+      // The redirect target is untrusted input (whatever answered — not
+      // Eureka's own configuration); a well-known pattern elsewhere in this
+      // file is to never echo untrusted values into a message. The mocked
+      // response carries a real Location header with a distinctive marker
+      // (unlike a response with no `headers` at all, against which this
+      // assertion would trivially pass either way) — the LEAK-MARKER
+      // assertion below actually fails if the code is changed to read it.
+      fetchMock.mockResolvedValue(
+        mockRedirectResponse(301, {
+          location: 'http://LEAK-MARKER.invalid/somewhere',
+        }),
+      );
+      const client = new EurekaClient(resolved);
+
+      const error = await client.renew().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).message).not.toContain(
+        'LEAK-MARKER',
+      );
+      expect(String(error)).not.toContain('LEAK-MARKER');
+    });
+
+    it('drains the response body on a redirect, same as any other response', async () => {
+      const cancel = jest.fn().mockResolvedValue(undefined);
+      fetchMock.mockResolvedValue(
+        mockRedirectResponse(301, { body: { cancel } }),
+      );
+      const client = new EurekaClient(resolved);
+
+      await client.renew().catch(() => undefined);
+
+      expect(cancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('a 3xx response does NOT fail over to another configured server — it is a real, definitive answer, classified the same as a 4xx', async () => {
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: ['http://a:8761/eureka', 'http://b:8762/eureka'],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockRedirectResponse(301)
+            : mockResponse({ ok: true, status: 200 }),
+        ),
+      );
+
+      const error = await client.renew().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBe(301);
+      expect(fetchMock).toHaveBeenCalledTimes(1); // B was never contacted
+    });
+
+    it('deregister() composes correctly with #17: a redirect on one server still lets every other configured server be attempted', async () => {
+      const client = new EurekaClient(
+        resolveOptions({
+          serviceUrl: ['http://a:8761/eureka', 'http://b:8762/eureka'],
+          instance: {
+            app: 'my-app',
+            hostName: 'host-1',
+            ipAddr: '10.0.0.1',
+            port: 3000,
+          },
+        }),
+      );
+      fetchMock.mockImplementation((url: string) =>
+        Promise.resolve(
+          url.includes('a:8761')
+            ? mockRedirectResponse(301)
+            : mockResponse({ ok: true, status: 200 }),
+        ),
+      );
+
+      const error = await client.deregister().catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(EurekaRequestError);
+      expect((error as EurekaRequestError).status).toBe(301);
+      // deregister()'s own "try every server" loop, not withFailover()'s
+      // "stop at first success" — the redirect on A does not stop B from
+      // being attempted too.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('timeout and cancellation', () => {
