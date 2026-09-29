@@ -60,6 +60,8 @@ For deregistration to run on a clean shutdown (SIGTERM/SIGINT), call `app.enable
 | `registrationMode` | no | `'fail-fast'` | `'fail-fast'` or `'background'` — what happens when the initial registration fails. See [Service registration](#service-registration). |
 | `requestTimeoutMs` | no | `5000` | Timeout for each individual Eureka HTTP request. At most 2,147,483,647 (see note below). |
 
+> `instance.app`, `instance.hostName`, `instance.ipAddr`, and `instance.instanceId` (if set) must not be empty or whitespace-only — such a value is rejected at configuration time. A value that passes is used exactly as given; surrounding whitespace is never trimmed.
+
 > `heartbeatIntervalSeconds`, `leaseDurationSeconds`, and `requestTimeoutMs` are rejected at configuration time if they'd exceed Node's 32-bit signed timer-delay limit (2,147,483,647ms, once converted to ms for `heartbeatIntervalSeconds`) — a larger value doesn't fail loudly on its own: `setTimeout` silently clamps it to ~1ms (turning the heartbeat loop into a hot loop instead of the intended ~25-day-max interval), and `AbortSignal.timeout` throws a confusing generic `RangeError` from inside a request.
 
 ## `EurekaModule.forRoot()`

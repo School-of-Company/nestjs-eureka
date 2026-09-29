@@ -1,4 +1,8 @@
-import { resolveOptions, type EurekaClientOptions } from './options';
+import {
+  resolveOptions,
+  type EurekaClientOptions,
+  type ResolvedEurekaOptions,
+} from './options';
 
 function baseOptions(): EurekaClientOptions {
   return {
@@ -136,6 +140,45 @@ describe('resolveOptions', () => {
       options.heartbeatIntervalSeconds = maxHeartbeatSeconds + 1;
       options.leaseDurationSeconds = MAX_TIMER_DELAY_MS;
       expect(() => resolveOptions(options)).toThrow(/heartbeatIntervalSeconds/);
+    });
+  });
+
+  describe('whitespace-only instance identity values (#13)', () => {
+    type IdentityField = 'app' | 'hostName' | 'ipAddr' | 'instanceId';
+
+    // Where each field's value ends up after resolving. `app` itself is only
+    // kept uppercased (as `eurekaAppName`), so it's read back through
+    // `vipAddress`, which defaults to `app` verbatim.
+    const identityFields: Array<
+      [IdentityField, (resolved: ResolvedEurekaOptions) => string]
+    > = [
+      ['app', (resolved) => resolved.instance.vipAddress],
+      ['hostName', (resolved) => resolved.instance.hostName],
+      ['ipAddr', (resolved) => resolved.instance.ipAddr],
+      ['instanceId', (resolved) => resolved.instance.instanceId],
+    ];
+
+    describe.each(identityFields)('instance.%s', (field, readBack) => {
+      it.each([
+        ['an empty string', ''],
+        ['spaces', '   '],
+        ['a tab', '\t'],
+        ['a newline', '\n'],
+        ['mixed spaces/tabs/newlines', ' \t\r\n '],
+      ])('rejects %s', (_label, value) => {
+        const options = baseOptions();
+        options.instance[field] = value;
+        expect(() => resolveOptions(options)).toThrow(`"instance.${field}"`);
+      });
+
+      it.each(['my-value', '  padded value  '])(
+        'accepts %p, keeping it exactly as given (not trimmed)',
+        (value) => {
+          const options = baseOptions();
+          options.instance[field] = value;
+          expect(readBack(resolveOptions(options))).toBe(value);
+        },
+      );
     });
   });
 
