@@ -1,14 +1,13 @@
 # nestjs-eureka
 
 [![CI](https://github.com/School-of-Company/nestjs-eureka/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/School-of-Company/nestjs-eureka/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40school-of-company%2Fnestjs-eureka.svg)](https://www.npmjs.com/package/@school-of-company/nestjs-eureka)
 
 A NestJS integration for Netflix Eureka service registration and discovery.
 
 > **Status: pre-release.** The public API may still change before a 1.0 release. Verified both against an in-repo HTTP stub server and manually against a real Spring Cloud Netflix Eureka Server — see [Compatibility](#compatibility).
 
 ## Installation
-
-> This package has not been published yet.
 
 ```bash
 pnpm add @school-of-company/nestjs-eureka
